@@ -100,6 +100,20 @@ mod tests {
     }
 
     #[test]
+    fn wrapped_class_path_with_crlf() {
+        let m = parse_manifest(
+            b"Class-Path: jakarta.xml.bind-api-2.3.2.jar txw2-2.3.2.jar istack-commons\r\n -runtime-3.0.8.jar stax-ex-1.8.1.jar FastInfoset-1.2.16.jar jakarta.act\r\n ivation-api-1.2.1.jar\r\nMain-Class: x.Main\r\n",
+        );
+        assert_eq!(
+            m.get("Class-Path"),
+            Some(
+                "jakarta.xml.bind-api-2.3.2.jar txw2-2.3.2.jar istack-commons-runtime-3.0.8.jar stax-ex-1.8.1.jar FastInfoset-1.2.16.jar jakarta.activation-api-1.2.1.jar"
+            )
+        );
+        assert_eq!(m.get("Main-Class"), Some("x.Main"));
+    }
+
+    #[test]
     fn crlf_and_lf_agree() {
         let lf = parse_manifest(b"A: 1\nB: long\n er\nMulti-Release: true\n");
         let crlf = parse_manifest(b"A: 1\r\nB: long\r\n er\r\nMulti-Release: true\r\n");

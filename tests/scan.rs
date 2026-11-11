@@ -292,16 +292,22 @@ fn manifest_is_accessible() {
         &[("com/A.class", class_bytes(0, 52))],
     );
     let r = scan(&jar);
-    assert_eq!(r.manifest.get("Main-Class"), Some("com.example.Main"));
-    assert_eq!(r.manifest.get("Manifest-Version"), Some("1.0"));
+    assert_eq!(
+        r.manifest.as_ref().and_then(|m| m.get("Main-Class")),
+        Some("com.example.Main")
+    );
+    assert_eq!(
+        r.manifest.as_ref().and_then(|m| m.get("Manifest-Version")),
+        Some("1.0")
+    );
 }
 
 #[test]
-fn missing_manifest_is_empty() {
+fn missing_manifest_is_none() {
     let dir = TempDir::new().expect("tempdir");
     let jar = make_jar(dir.path(), "a.jar", &[("com/A.class", class_bytes(0, 52))]);
     let r = scan(&jar);
-    assert_eq!(r.manifest.get("Manifest-Version"), None);
+    assert_eq!(r.manifest, None);
     assert!(!r.multi_release);
 }
 

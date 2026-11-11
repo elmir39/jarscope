@@ -69,7 +69,7 @@ pub struct JarReport {
     pub ignored_versioned: usize,
     pub module_info: Vec<(String, u16)>,
     pub invalid: Vec<(String, String)>,
-    pub manifest: Manifest,
+    pub manifest: Option<Manifest>,
 }
 
 impl JarReport {
@@ -85,7 +85,7 @@ pub fn scan_jar(path: &Path) -> anyhow::Result<JarReport> {
 
     let manifest = read_manifest(&mut archive);
     let mut report = JarReport {
-        multi_release: manifest.is_multi_release(),
+        multi_release: manifest.as_ref().is_some_and(Manifest::is_multi_release),
         manifest,
         ..JarReport::default()
     };
@@ -147,14 +147,15 @@ pub fn scan_jar(path: &Path) -> anyhow::Result<JarReport> {
     Ok(report)
 }
 
-fn read_manifest<R: Read + Seek>(archive: &mut ZipArchive<R>) -> Manifest {
+fn read_manifest<R: Read + Seek>(archive: &mut ZipArchive<R>) -> Option<Manifest> {
+    archive.index_for_name(MANIFEST_NAME)?;
     let Ok(entry) = archive.by_name(MANIFEST_NAME) else {
-        return Manifest::default();
+        return Some(Manifest::default());
     };
     let mut bytes = Vec::new();
     match entry.take(MANIFEST_LIMIT).read_to_end(&mut bytes) {
-        Ok(_) => parse_manifest(&bytes),
-        Err(_) => Manifest::default(),
+        Ok(_) => Some(parse_manifest(&bytes)),
+        Err(_) => Some(Manifest::default()),
     }
 }
 
