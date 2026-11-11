@@ -166,7 +166,7 @@ fn preview_base_class() {
         ],
     );
     let r = scan(&jar);
-    assert_eq!(r.preview, ["com/P.class"]);
+    assert_eq!(r.preview, [("com/P.class".to_string(), 61)]);
     assert_eq!(r.base, counts(&[(52, 1), (61, 1)]));
     assert_eq!(r.required_major(), Some(61));
 }
@@ -184,7 +184,10 @@ fn preview_versioned_class_in_multi_release_jar() {
         ],
     );
     let r = scan(&jar);
-    assert_eq!(r.preview, ["META-INF/versions/21/com/P.class"]);
+    assert_eq!(
+        r.preview,
+        [("META-INF/versions/21/com/P.class".to_string(), 65)]
+    );
     assert_eq!(r.versioned[&21][&65], 1);
     assert_eq!(r.required_major(), Some(52));
 }

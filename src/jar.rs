@@ -80,8 +80,8 @@ const HEADER_LEN: u64 = 8;
 pub struct JarReport {
     /// Major version → number of base classes ([`EntryKind::Class`]) with that version.
     pub base: BTreeMap<u16, usize>,
-    /// Names of preview classes (minor `0xFFFF`), base or counted versioned ones.
-    pub preview: Vec<String>,
+    /// Preview classes (minor `0xFFFF`), base or counted versioned ones: name and major.
+    pub preview: Vec<(String, u16)>,
     /// True if the manifest has `Multi-Release: true`.
     pub multi_release: bool,
     /// Release `N` → (major → count) for `META-INF/versions/N/` classes.
@@ -172,7 +172,7 @@ pub fn scan_jar(path: &Path) -> anyhow::Result<JarReport> {
             EntryKind::Other => continue,
         }
         if header.is_preview() {
-            report.preview.push(entry_name(&archive, i));
+            report.preview.push((entry_name(&archive, i), header.major));
         }
     }
     Ok(report)
