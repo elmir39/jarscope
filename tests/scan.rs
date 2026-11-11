@@ -231,9 +231,7 @@ fn corrupt_compressed_data_is_invalid_not_fatal() {
             ("com/Corrupt.class", class_bytes(0, 52)),
         ],
     );
-    // Overwrite the start of com/Corrupt.class's deflate stream with 0xFF bytes
-    // (BTYPE = 11, a reserved block type). The first occurrence of the name is in the
-    // local file header: name length at offset 26, extra length at 28, name at 30.
+    // 0xFF at the start of a deflate stream means block type 11 (reserved) -> corrupt data.
     let mut bytes = std::fs::read(&jar).expect("read jar");
     let name = b"com/Corrupt.class";
     let pos = bytes
@@ -273,7 +271,6 @@ fn directories_and_resources_ignored() {
             ("com/foo/", vec![]),
             ("x.class/", vec![]),
             ("config.properties", b"a=b".to_vec()),
-            // Not a class file, but not named .class either: must not be opened or parsed.
             ("data.bin", b"garbage".to_vec()),
             ("com/foo/A.class", class_bytes(0, 52)),
         ],

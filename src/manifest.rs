@@ -1,15 +1,9 @@
-//! JAR manifest parsing (main section only).
-
-/// Main-section attributes of a `META-INF/MANIFEST.MF`.
-///
-/// Names are matched case-insensitively; the original spelling and value text are kept.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Manifest {
     attributes: Vec<(String, String)>,
 }
 
 impl Manifest {
-    /// Value of the attribute `name` (ASCII case-insensitive), if present.
     pub fn get(&self, name: &str) -> Option<&str> {
         self.attributes
             .iter()
@@ -17,16 +11,13 @@ impl Manifest {
             .map(|(_, v)| v.as_str())
     }
 
-    /// True if `Multi-Release` equals `true` ignoring ASCII case (no trimming, like the JVM).
+    // Not trimmed on purpose: the JVM treats "true " as false.
     pub fn is_multi_release(&self) -> bool {
         self.get("Multi-Release")
             .is_some_and(|v| v.eq_ignore_ascii_case("true"))
     }
 }
 
-/// Parses the main section of a manifest. Never fails: invalid UTF-8 is replaced,
-/// lines without `": "` are skipped, and parsing stops at the first empty line.
-/// If a name repeats, the last value wins.
 pub fn parse_manifest(bytes: &[u8]) -> Manifest {
     let text = String::from_utf8_lossy(bytes)
         .replace("\r\n", "\n")

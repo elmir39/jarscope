@@ -1,12 +1,8 @@
-//! Text rendering of a [`JarReport`] for the `version` command.
-
 use crate::classfile::java_version;
 use crate::jar::JarReport;
 
-/// Most names listed in the preview and invalid sections.
 const MAX_LISTED: usize = 10;
 
-/// `Java 8`, or `unknown (major N)` for majors below 45.
 fn label(major: u16) -> String {
     match java_version(major) {
         Some(v) => format!("Java {v}"),
@@ -22,7 +18,6 @@ fn plural(n: usize, noun: &str) -> String {
     }
 }
 
-/// Appends at most [`MAX_LISTED`] indented lines, then `… and N more`.
 fn push_list(out: &mut String, lines: &[String]) {
     for line in lines.iter().take(MAX_LISTED) {
         out.push_str("  ");
@@ -34,7 +29,6 @@ fn push_list(out: &mut String, lines: &[String]) {
     }
 }
 
-/// Renders the `version` command output; ends with a single newline.
 pub fn render_version(report: &JarReport) -> String {
     let mut sections: Vec<String> = Vec::new();
 

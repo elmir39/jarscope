@@ -1,31 +1,23 @@
-//! Class file header parsing: magic number and class file version.
-
 use std::fmt;
 
 const MAGIC: [u8; 4] = [0xCA, 0xFE, 0xBA, 0xBE];
 
-/// Minor and major version from the first 8 bytes of a class file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ClassHeader {
-    /// Minor version (bytes 4–5, big-endian).
     pub minor: u16,
-    /// Major version (bytes 6–7, big-endian).
     pub major: u16,
 }
 
 impl ClassHeader {
-    /// True if the class was compiled with preview features (Java 12+ only).
+    // Preview features exist only since Java 12 (major 56).
     pub fn is_preview(&self) -> bool {
         self.minor == 0xFFFF && self.major >= 56
     }
 }
 
-/// Why a class header could not be parsed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HeaderError {
-    /// Fewer than 8 bytes were available.
     Truncated,
-    /// The first four bytes are not `CA FE BA BE`.
     BadMagic,
 }
 
@@ -40,7 +32,6 @@ impl fmt::Display for HeaderError {
 
 impl std::error::Error for HeaderError {}
 
-/// Parses the class file header. Only the first 8 bytes are used; extra bytes are ignored.
 pub fn parse_header(bytes: &[u8]) -> Result<ClassHeader, HeaderError> {
     match bytes {
         [a, b, c, d, mi0, mi1, ma0, ma1, ..] => {
@@ -56,9 +47,6 @@ pub fn parse_header(bytes: &[u8]) -> Result<ClassHeader, HeaderError> {
     }
 }
 
-/// Maps a class file major version to the Java release name (e.g. 52 → "8").
-///
-/// Returns `None` for majors below 45, which are not real class file versions.
 pub fn java_version(major: u16) -> Option<String> {
     match major {
         0..=44 => None,

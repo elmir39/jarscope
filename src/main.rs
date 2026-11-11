@@ -6,7 +6,6 @@ use clap::{Parser, Subcommand};
 use jarscope::jar::scan_jar;
 use jarscope::render::render_version;
 
-/// Inspects Java JAR files without a JVM.
 #[derive(Parser)]
 #[command(version, about)]
 struct Cli {
@@ -16,9 +15,9 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Show the Java version a JAR requires, with a per-version class breakdown
+    #[command(about = "Show the Java version a JAR requires, with a per-version class breakdown")]
     Version {
-        /// Path to the JAR file
+        #[arg(help = "Path to the JAR file")]
         jar: PathBuf,
     },
 }

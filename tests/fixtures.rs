@@ -1,5 +1,3 @@
-//! Tests against JARs built with a real JDK (see `tests/fixtures/build.sh`).
-
 use std::path::{Path, PathBuf};
 
 use assert_cmd::Command;
