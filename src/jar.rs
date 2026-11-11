@@ -17,11 +17,11 @@ pub enum EntryKind {
     Other,
 }
 
-const VERSIONS_PREFIX: &str = "META-INF/versions/";
+pub(crate) const VERSIONS_PREFIX: &str = "META-INF/versions/";
 const MODULE_INFO: &str = "module-info.class";
 
 // Digits only: `"+9".parse::<u32>()` succeeds.
-fn parse_release(s: &str) -> Option<u32> {
+pub(crate) fn parse_release(s: &str) -> Option<u32> {
     if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
