@@ -71,3 +71,78 @@ fn cli_multi_release() {
         "{text}"
     );
 }
+
+fn run(args: &[&str], jar: &str) -> String {
+    let out = Command::cargo_bin("jarscope")
+        .expect("binary")
+        .args(args)
+        .arg(fixture(jar))
+        .output()
+        .expect("run");
+    assert_eq!(out.status.code(), Some(0));
+    assert!(
+        out.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8(out.stdout).expect("utf-8")
+}
+
+#[test]
+fn list_multi_release() {
+    assert_eq!(
+        run(&["list"], "multi-release.jar"),
+        "\
+META-INF/
+META-INF/MANIFEST.MF
+META-INF/versions/17/
+META-INF/versions/17/fixture/
+META-INF/versions/17/fixture/M$Named.class
+META-INF/versions/17/fixture/M.class
+META-INF/versions/9/module-info.class
+fixture/
+fixture/M.class
+"
+    );
+}
+
+#[test]
+fn list_classes_only_multi_release() {
+    assert_eq!(
+        run(&["list", "--classes-only"], "multi-release.jar"),
+        "\
+fixture.M
+module-info (META-INF/versions/9)
+fixture.M (META-INF/versions/17)
+fixture.M$Named (META-INF/versions/17)
+"
+    );
+}
+
+#[test]
+fn info_release8() {
+    assert_eq!(
+        run(&["info"], "release8.jar"),
+        "\
+Created-By:     25 (Oracle Corporation)
+Multi-Release:  false
+Entries:        4 (1 class)
+Compressed:     251 bytes
+Uncompressed:   302 bytes
+"
+    );
+}
+
+#[test]
+fn info_multi_release() {
+    assert_eq!(
+        run(&["info"], "multi-release.jar"),
+        "\
+Created-By:     25 (Oracle Corporation)
+Multi-Release:  true
+Entries:        9 (4 classes)
+Compressed:     1.3 KB (1,293 bytes)
+Uncompressed:   2.1 KB (2,116 bytes)
+"
+    );
+}
