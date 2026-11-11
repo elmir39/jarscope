@@ -9,3 +9,4 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - Never panic on bad JARs; in folder scans, warn and skip the bad JAR.
 - Check output against `javap -v`, `jar tf` and `unzip -v`.
 - Comments only for very important, non-obvious *why* (JVM quirks, safety limits); no doc comments that restate the code.
+- `zip` collapses duplicate entry names (see `has_duplicate_names`); `jar tf`/`unzip` show all. `by_index_data(i)` gives central-directory metadata with no I/O; `by_index_raw` seeks.
