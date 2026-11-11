@@ -1,5 +1,6 @@
 use crate::classfile::java_version;
 use crate::jar::JarReport;
+use crate::names::{class_name, sort_classes, sort_for_list};
 
 const MAX_LISTED: usize = 10;
 
@@ -131,6 +132,33 @@ pub fn render_version(report: &JarReport) -> String {
     sections.join("\n")
 }
 
+pub fn render_list(report: &JarReport, classes_only: bool) -> String {
+    let mut out = String::new();
+    if classes_only {
+        let mut classes: Vec<_> = report
+            .entries
+            .iter()
+            .filter_map(|e| class_name(&e.name))
+            .collect();
+        sort_classes(&mut classes);
+        for c in &classes {
+            out.push_str(&c.name);
+            if let Some(r) = c.release {
+                out.push_str(&format!(" (META-INF/versions/{r})"));
+            }
+            out.push('\n');
+        }
+    } else {
+        let mut names: Vec<&str> = report.entries.iter().map(|e| e.name.as_str()).collect();
+        sort_for_list(&mut names);
+        for n in names {
+            out.push_str(n);
+            out.push('\n');
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -252,5 +280,57 @@ Invalid class files: 1
         assert!(out.contains(
             "Preview classes: 2 — need exactly the Java version shown, with --enable-preview\n  A.class (Java 17)\n  B.class (Java 21)\n"
         ));
+    }
+
+    fn entries(names: &[&str]) -> JarReport {
+        JarReport {
+            entries: names
+                .iter()
+                .enumerate()
+                .map(|(index, n)| crate::jar::Entry {
+                    index,
+                    name: n.to_string(),
+                    size: 0,
+                    compressed_size: 0,
+                })
+                .collect(),
+            ..JarReport::default()
+        }
+    }
+
+    #[test]
+    fn list_all_in_list_order() {
+        let r = entries(&[
+            "com/foo/bar/X.class",
+            "com/foo/baz.txt",
+            "com/foo/",
+            "A.txt",
+        ]);
+        assert_eq!(
+            render_list(&r, false),
+            "A.txt\ncom/foo/\ncom/foo/baz.txt\ncom/foo/bar/X.class\n"
+        );
+    }
+
+    #[test]
+    fn list_classes_only_with_release_suffix() {
+        let r = entries(&[
+            "META-INF/versions/17/com/foo/Bar.class",
+            "README.md",
+            "com/foo/",
+            "com/foo/Bar.class",
+            "META-INF/versions/9/module-info.class",
+        ]);
+        assert_eq!(
+            render_list(&r, true),
+            "com.foo.Bar\nmodule-info (META-INF/versions/9)\ncom.foo.Bar (META-INF/versions/17)\n"
+        );
+    }
+
+    #[test]
+    fn list_empty() {
+        let r = JarReport::default();
+        assert_eq!(render_list(&r, false), "");
+        assert_eq!(render_list(&r, true), "");
     }
 }

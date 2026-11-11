@@ -3,7 +3,7 @@ mod common;
 use std::path::Path;
 
 use assert_cmd::Command;
-use common::{class_bytes, make_jar, make_jar_with_manifest};
+use common::{class_bytes, make_jar, make_jar_with_duplicate, make_jar_with_manifest};
 use tempfile::TempDir;
 
 fn jarscope() -> Command {
@@ -11,7 +11,12 @@ fn jarscope() -> Command {
 }
 
 fn assert_error(path: &Path, needle: Option<&str>) {
-    let out = jarscope().arg("version").arg(path).output().expect("run");
+    assert_error_for("version", path, needle);
+    assert_error_for("list", path, needle);
+}
+
+fn assert_error_for(cmd: &str, path: &Path, needle: Option<&str>) {
+    let out = jarscope().arg(cmd).arg(path).output().expect("run");
     assert_eq!(out.status.code(), Some(2));
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(err.starts_with("error: "), "{err}");
@@ -112,4 +117,106 @@ fn closed_stdout_does_not_panic() {
     drop(child.stdout.take());
     let status = child.wait().expect("wait");
     assert_ne!(status.code(), Some(101));
+}
+
+#[test]
+fn list_prints_entries_in_order() {
+    let dir = TempDir::new().expect("tempdir");
+    let jar = make_jar(
+        dir.path(),
+        "a.jar",
+        &[
+            ("com/foo/bar/X.class", class_bytes(0, 52)),
+            ("com/foo/baz.txt", b"t".to_vec()),
+            ("com/foo/", vec![]),
+            ("com/foo/Bar.class", class_bytes(0, 52)),
+        ],
+    );
+    let out = jarscope().arg("list").arg(&jar).output().expect("run");
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "com/foo/\ncom/foo/Bar.class\ncom/foo/baz.txt\ncom/foo/bar/X.class\n"
+    );
+    assert!(out.stderr.is_empty());
+}
+
+#[test]
+fn list_classes_only() {
+    let dir = TempDir::new().expect("tempdir");
+    let jar = make_jar(
+        dir.path(),
+        "a.jar",
+        &[
+            ("com/foo/Bar.class", class_bytes(0, 52)),
+            ("README.md", b"x".to_vec()),
+            ("META-INF/versions/17/com/foo/Bar.class", class_bytes(0, 61)),
+        ],
+    );
+    let out = jarscope()
+        .args(["list", "--classes-only"])
+        .arg(&jar)
+        .output()
+        .expect("run");
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "com.foo.Bar\ncom.foo.Bar (META-INF/versions/17)\n"
+    );
+}
+
+#[test]
+fn list_duplicate_names_warns_on_stderr() {
+    let dir = TempDir::new().expect("tempdir");
+    let jar = make_jar_with_duplicate(dir.path(), "d.jar", class_bytes(0, 52), class_bytes(0, 55));
+    let out = jarscope().arg("list").arg(&jar).output().expect("run");
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "a/A.class\n");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("warning: ")
+            && err.contains("has duplicate entry names; each name is listed once"),
+        "{err}"
+    );
+}
+
+#[test]
+fn list_empty_jar() {
+    let dir = TempDir::new().expect("tempdir");
+    let jar = make_jar(dir.path(), "e.jar", &[]);
+    let out = jarscope().arg("list").arg(&jar).output().expect("run");
+    assert_eq!(out.status.code(), Some(0));
+    assert!(out.stdout.is_empty());
+}
+
+#[test]
+fn list_help() {
+    let out = jarscope().args(["list", "--help"]).output().expect("run");
+    assert_eq!(out.status.code(), Some(0));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("--classes-only"));
+}
+
+#[test]
+fn list_closed_stdout_exits_quietly() {
+    use std::process::{Command as Std, Stdio};
+    let dir = TempDir::new().expect("tempdir");
+    let names: Vec<String> = (0..20000).map(|i| format!("p/C{i}.class")).collect();
+    let entries: Vec<(&str, Vec<u8>)> = names.iter().map(|n| (n.as_str(), Vec::new())).collect();
+    let jar = make_jar(dir.path(), "big.jar", &entries);
+    let bin = assert_cmd::cargo::cargo_bin("jarscope");
+    let mut child = Std::new(bin)
+        .arg("list")
+        .arg(&jar)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn");
+    drop(child.stdout.take());
+    let out = child.wait_with_output().expect("wait");
+    assert_eq!(out.status.code(), Some(0));
+    assert!(
+        out.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
