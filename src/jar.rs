@@ -60,6 +60,20 @@ const MANIFEST_LIMIT: u64 = 1 << 20;
 
 const HEADER_LEN: u64 = 8;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Entry {
+    pub index: usize,
+    pub name: String,
+    pub size: u64,
+    pub compressed_size: u64,
+}
+
+impl Entry {
+    pub fn is_dir(&self) -> bool {
+        self.name.ends_with('/')
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct JarReport {
     pub base: BTreeMap<u16, usize>,
@@ -70,41 +84,53 @@ pub struct JarReport {
     pub module_info: Vec<(String, u16)>,
     pub invalid: Vec<(String, String)>,
     pub manifest: Option<Manifest>,
+    pub entries: Vec<Entry>,
+    pub duplicate_names: bool,
 }
 
 impl JarReport {
     pub fn required_major(&self) -> Option<u16> {
         self.base.keys().next_back().copied()
     }
+
+    pub fn class_count(&self) -> usize {
+        self.entries
+            .iter()
+            .filter(|e| !e.is_dir() && e.name.ends_with(".class"))
+            .count()
+    }
+
+    // Sizes come from untrusted headers; a plain `+` panics on overflow in debug builds.
+    pub fn total_size(&self) -> u64 {
+        self.entries
+            .iter()
+            .fold(0, |sum, e| sum.saturating_add(e.size))
+    }
+
+    pub fn total_compressed_size(&self) -> u64 {
+        self.entries
+            .iter()
+            .fold(0, |sum, e| sum.saturating_add(e.compressed_size))
+    }
+}
+
+fn open(path: &Path) -> anyhow::Result<ZipArchive<File>> {
+    let file = File::open(path).with_context(|| format!("cannot open {}", path.display()))?;
+    ZipArchive::new(file).with_context(|| format!("{} is not a valid JAR/ZIP file", path.display()))
+}
+
+pub fn read_index(path: &Path) -> anyhow::Result<JarReport> {
+    let mut archive = open(path)?;
+    Ok(index(&mut archive))
 }
 
 pub fn scan_jar(path: &Path) -> anyhow::Result<JarReport> {
-    let file = File::open(path).with_context(|| format!("cannot open {}", path.display()))?;
-    let mut archive = ZipArchive::new(file)
-        .with_context(|| format!("{} is not a valid JAR/ZIP file", path.display()))?;
-
-    let manifest = read_manifest(&mut archive);
-    let mut report = JarReport {
-        multi_release: manifest.as_ref().is_some_and(Manifest::is_multi_release),
-        manifest,
-        ..JarReport::default()
-    };
+    let mut archive = open(path)?;
+    let mut report = index(&mut archive);
 
     let mut buf = Vec::with_capacity(HEADER_LEN as usize);
-    for i in 0..archive.len() {
-        let kind = match archive.name_for_index(i) {
-            Some(Ok(name)) => classify(&name, name.ends_with('/')),
-            Some(Err(e)) => {
-                report.invalid.push((format!("entry #{i}"), e.to_string()));
-                continue;
-            }
-            None => {
-                report
-                    .invalid
-                    .push((format!("entry #{i}"), "missing entry".to_string()));
-                continue;
-            }
-        };
+    for entry in &report.entries {
+        let kind = classify(&entry.name, entry.is_dir());
         if kind == EntryKind::Other {
             continue;
         }
@@ -113,10 +139,10 @@ pub fn scan_jar(path: &Path) -> anyhow::Result<JarReport> {
             continue;
         }
 
-        let header = match read_header(&mut archive, i, &mut buf) {
+        let header = match read_header(&mut archive, entry.index, &mut buf) {
             Ok(header) => header,
             Err(reason) => {
-                report.invalid.push((entry_name(&archive, i), reason));
+                report.invalid.push((entry.name.clone(), reason));
                 continue;
             }
         };
@@ -133,18 +159,43 @@ pub fn scan_jar(path: &Path) -> anyhow::Result<JarReport> {
                     .or_default() += 1;
             }
             EntryKind::ModuleInfo { .. } => {
-                report
-                    .module_info
-                    .push((entry_name(&archive, i), header.major));
+                report.module_info.push((entry.name.clone(), header.major));
                 continue;
             }
             EntryKind::Other => continue,
         }
         if header.is_preview() {
-            report.preview.push((entry_name(&archive, i), header.major));
+            report.preview.push((entry.name.clone(), header.major));
         }
     }
     Ok(report)
+}
+
+// Opens no entry but the manifest: `list` and `info` must read only the central directory.
+fn index<R: Read + Seek>(archive: &mut ZipArchive<R>) -> JarReport {
+    let manifest = read_manifest(archive);
+    let mut report = JarReport {
+        multi_release: manifest.as_ref().is_some_and(Manifest::is_multi_release),
+        manifest,
+        duplicate_names: archive.has_duplicate_names(),
+        entries: Vec::with_capacity(archive.len()),
+        ..JarReport::default()
+    };
+    for i in 0..archive.len() {
+        let entry = archive.by_index_data(i).and_then(|data| {
+            Ok(Entry {
+                index: i,
+                name: data.name()?.into_owned(),
+                size: data.size(),
+                compressed_size: data.compressed_size(),
+            })
+        });
+        match entry {
+            Ok(entry) => report.entries.push(entry),
+            Err(e) => report.invalid.push((format!("entry #{i}"), e.to_string())),
+        }
+    }
+    report
 }
 
 fn read_manifest<R: Read + Seek>(archive: &mut ZipArchive<R>) -> Option<Manifest> {
@@ -172,13 +223,6 @@ fn read_header<R: Read + Seek>(
         .read_to_end(buf)
         .map_err(|e| e.to_string())?;
     parse_header(buf).map_err(|e| e.to_string())
-}
-
-fn entry_name<R: Read + Seek>(archive: &ZipArchive<R>, i: usize) -> String {
-    match archive.name_for_index(i) {
-        Some(Ok(name)) => name.into_owned(),
-        _ => format!("entry #{i}"),
-    }
 }
 
 #[cfg(test)]
@@ -250,6 +294,22 @@ mod tests {
             c("META-INF/versions/abc/module-info.class"),
             EntryKind::Other
         );
+    }
+
+    #[test]
+    fn totals_saturate() {
+        let entry = |index| Entry {
+            index,
+            name: format!("e{index}"),
+            size: u64::MAX,
+            compressed_size: u64::MAX - 1,
+        };
+        let r = JarReport {
+            entries: vec![entry(0), entry(1)],
+            ..JarReport::default()
+        };
+        assert_eq!(r.total_size(), u64::MAX);
+        assert_eq!(r.total_compressed_size(), u64::MAX);
     }
 
     #[test]

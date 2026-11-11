@@ -51,3 +51,28 @@ pub fn make_jar_with_manifest(
     all.extend(entries.iter().map(|(n, d)| (*n, d.clone())));
     make_jar(dir, name, &all)
 }
+
+// `ZipWriter` refuses duplicate names, so write `a/B.class` and rename it in place to
+// `a/A.class` (same length, and the CRC doesn't cover the name).
+pub fn make_jar_with_duplicate(dir: &Path, name: &str, first: Vec<u8>, second: Vec<u8>) -> PathBuf {
+    let path = make_jar(dir, name, &[("a/A.class", first), ("a/B.class", second)]);
+    let mut bytes = std::fs::read(&path).expect("read jar");
+    let (from, to) = (b"a/B.class", b"a/A.class");
+    let mut replaced = 0;
+    let mut i = 0;
+    while i + from.len() <= bytes.len() {
+        if &bytes[i..i + from.len()] == from {
+            bytes[i..i + from.len()].copy_from_slice(to);
+            replaced += 1;
+            i += from.len();
+        } else {
+            i += 1;
+        }
+    }
+    assert_eq!(
+        replaced, 2,
+        "expected the name in one local and one central header"
+    );
+    std::fs::write(&path, bytes).expect("write jar");
+    path
+}
