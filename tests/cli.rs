@@ -13,6 +13,7 @@ fn jarscope() -> Command {
 fn assert_error(path: &Path, needle: Option<&str>) {
     assert_error_for("version", path, needle);
     assert_error_for("list", path, needle);
+    assert_error_for("info", path, needle);
 }
 
 fn assert_error_for(cmd: &str, path: &Path, needle: Option<&str>) {
@@ -218,5 +219,58 @@ fn list_closed_stdout_exits_quietly() {
         out.stderr.is_empty(),
         "{}",
         String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn info_reports_manifest_counts_and_sizes() {
+    let dir = TempDir::new().expect("tempdir");
+    let manifest = common::manifest_bytes(&[
+        ("Main-Class", "com.example.Main"),
+        ("Created-By", "test"),
+        ("Multi-Release", "true"),
+    ]);
+    let class = class_bytes(0, 52);
+    let readme = vec![b'x'; 1500];
+    let jar = make_jar_with_manifest(
+        dir.path(),
+        "a.jar",
+        &[
+            ("Main-Class", "com.example.Main"),
+            ("Created-By", "test"),
+            ("Multi-Release", "true"),
+        ],
+        &[
+            ("com/", Vec::new()),
+            ("com/A.class", class.clone()),
+            ("README", readme.clone()),
+        ],
+    );
+    let total = manifest.len() + class.len() + readme.len();
+    let out = jarscope().arg("info").arg(&jar).output().expect("run");
+    assert_eq!(out.status.code(), Some(0));
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.starts_with(
+        "Main-Class:     com.example.Main\nCreated-By:     test\nMulti-Release:  true\nEntries:        4 (1 class)\nCompressed:     "
+    ), "{text}");
+    assert!(
+        text.ends_with(&format!(
+            "Uncompressed:   1.7 KB (1,{:03} bytes)\n",
+            total - 1000
+        )),
+        "{text}"
+    );
+}
+
+#[test]
+fn info_without_manifest() {
+    let dir = TempDir::new().expect("tempdir");
+    let jar = make_jar(dir.path(), "a.jar", &[("A.class", class_bytes(0, 52))]);
+    let out = jarscope().arg("info").arg(&jar).output().expect("run");
+    assert_eq!(out.status.code(), Some(0));
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.starts_with("Manifest:      none\nEntries:       1 (1 class)\n"),
+        "{text}"
     );
 }

@@ -159,6 +159,82 @@ pub fn render_list(report: &JarReport, classes_only: bool) -> String {
     out
 }
 
+pub fn thousands(n: u64) -> String {
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
+pub fn human_size(n: u64) -> String {
+    if n < 1000 {
+        return if n == 1 {
+            "1 byte".to_string()
+        } else {
+            format!("{n} bytes")
+        };
+    }
+    const UNITS: [&str; 6] = ["KB", "MB", "GB", "TB", "PB", "EB"];
+    let mut value = n as f64 / 1000.0;
+    let mut unit = 0;
+    // Rounding first keeps 999,999 at "1.0 MB" instead of "1000.0 KB".
+    while (value * 10.0).round() / 10.0 >= 1000.0 && unit < UNITS.len() - 1 {
+        value /= 1000.0;
+        unit += 1;
+    }
+    format!("{value:.1} {}", UNITS[unit])
+}
+
+fn size_line(n: u64) -> String {
+    if n < 1000 {
+        human_size(n)
+    } else {
+        format!("{} ({} bytes)", human_size(n), thousands(n))
+    }
+}
+
+pub fn render_info(report: &JarReport) -> String {
+    let mut rows: Vec<(&str, String)> = Vec::new();
+    match &report.manifest {
+        None => rows.push(("Manifest", "none".to_string())),
+        Some(m) => {
+            for name in ["Main-Class", "Created-By", "Build-Jdk", "Build-Jdk-Spec"] {
+                if let Some(v) = m.get(name) {
+                    rows.push((name, v.to_string()));
+                }
+            }
+            rows.push(("Multi-Release", report.multi_release.to_string()));
+            if let Some(v) = m.get("Automatic-Module-Name") {
+                rows.push(("Automatic-Module-Name", v.to_string()));
+            }
+        }
+    }
+    let classes = report.class_count();
+    let noun = if classes == 1 { "class" } else { "classes" };
+    rows.push((
+        "Entries",
+        format!(
+            "{} ({} {noun})",
+            thousands(report.entries.len() as u64),
+            thousands(classes as u64)
+        ),
+    ));
+    rows.push(("Compressed", size_line(report.total_compressed_size())));
+    rows.push(("Uncompressed", size_line(report.total_size())));
+
+    let width = rows.iter().map(|(l, _)| l.len()).max().unwrap_or(0) + 3;
+    let mut out = String::new();
+    for (l, v) in &rows {
+        out.push_str(&format!("{:<width$}{v}\n", format!("{l}:")));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -332,5 +408,101 @@ Invalid class files: 1
         let r = JarReport::default();
         assert_eq!(render_list(&r, false), "");
         assert_eq!(render_list(&r, true), "");
+    }
+
+    #[test]
+    fn thousands_separators() {
+        assert_eq!(thousands(0), "0");
+        assert_eq!(thousands(999), "999");
+        assert_eq!(thousands(1000), "1,000");
+        assert_eq!(thousands(2_610_717), "2,610,717");
+        assert_eq!(thousands(u64::MAX), "18,446,744,073,709,551,615");
+    }
+
+    #[test]
+    fn human_sizes() {
+        assert_eq!(human_size(0), "0 bytes");
+        assert_eq!(human_size(1), "1 byte");
+        assert_eq!(human_size(999), "999 bytes");
+        assert_eq!(human_size(1000), "1.0 KB");
+        assert_eq!(human_size(1293), "1.3 KB");
+        assert_eq!(human_size(999_999), "1.0 MB");
+        assert_eq!(human_size(2_610_717), "2.6 MB");
+        assert_eq!(human_size(u64::MAX), "18.4 EB");
+    }
+
+    fn with_manifest(attrs: &[(&str, &str)]) -> JarReport {
+        let mut text = String::from("Manifest-Version: 1.0\r\n");
+        for (k, v) in attrs {
+            text.push_str(&format!("{k}: {v}\r\n"));
+        }
+        let m = crate::manifest::parse_manifest(text.as_bytes());
+        JarReport {
+            multi_release: m.is_multi_release(),
+            manifest: Some(m),
+            ..JarReport::default()
+        }
+    }
+
+    #[test]
+    fn info_full_manifest() {
+        let mut r = with_manifest(&[
+            ("Automatic-Module-Name", "com.example"),
+            ("Build-Jdk-Spec", "21"),
+            ("Created-By", "Maven"),
+            ("Main-Class", "com.example.Main"),
+            ("Build-Jdk", "21.0.5"),
+        ]);
+        r.entries = vec![
+            crate::jar::Entry {
+                index: 0,
+                name: "A.class".into(),
+                size: 2_000,
+                compressed_size: 1_000,
+            },
+            crate::jar::Entry {
+                index: 1,
+                name: "B.txt".into(),
+                size: 5,
+                compressed_size: 1,
+            },
+        ];
+        assert_eq!(
+            render_info(&r),
+            "\
+Main-Class:             com.example.Main
+Created-By:             Maven
+Build-Jdk:              21.0.5
+Build-Jdk-Spec:         21
+Multi-Release:          false
+Automatic-Module-Name:  com.example
+Entries:                2 (1 class)
+Compressed:             1.0 KB (1,001 bytes)
+Uncompressed:           2.0 KB (2,005 bytes)
+"
+        );
+    }
+
+    #[test]
+    fn info_no_manifest() {
+        assert_eq!(
+            render_info(&JarReport::default()),
+            "Manifest:      none\nEntries:       0 (0 classes)\nCompressed:    0 bytes\nUncompressed:  0 bytes\n"
+        );
+    }
+
+    #[test]
+    fn info_only_manifest_version() {
+        let r = with_manifest(&[]);
+        assert_eq!(
+            render_info(&r),
+            "Multi-Release:  false\nEntries:        0 (0 classes)\nCompressed:     0 bytes\nUncompressed:   0 bytes\n"
+        );
+    }
+
+    #[test]
+    fn info_trailing_space_multi_release_is_false() {
+        let r = with_manifest(&[("Multi-Release", "true ")]);
+        assert!(render_info(&r).starts_with("Multi-Release:  false\n"));
     }
 }

@@ -3,8 +3,9 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
+use jarscope::jar::JarReport;
 use jarscope::jar::{read_index, scan_jar};
-use jarscope::render::{render_list, render_version};
+use jarscope::render::{render_info, render_list, render_version};
 
 #[derive(Parser)]
 #[command(version, about)]
@@ -27,6 +28,11 @@ enum Command {
         #[arg(long, help = "List only classes, as dotted names")]
         classes_only: bool,
     },
+    #[command(about = "Show manifest fields, entry counts and sizes of a JAR")]
+    Info {
+        #[arg(help = "Path to the JAR file")]
+        jar: PathBuf,
+    },
 }
 
 fn write_stdout(text: &str) -> ExitCode {
@@ -41,33 +47,43 @@ fn write_stdout(text: &str) -> ExitCode {
     }
 }
 
+fn fail(err: &anyhow::Error) -> ExitCode {
+    eprintln!("error: {err:#}");
+    ExitCode::from(2)
+}
+
+fn warn(report: &JarReport, jar: &std::path::Path, duplicate_note: &str) {
+    if report.duplicate_names {
+        eprintln!(
+            "warning: {} has duplicate entry names; {duplicate_note}",
+            jar.display()
+        );
+    }
+    for (name, reason) in &report.invalid {
+        eprintln!("warning: {name}: {reason}");
+    }
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
     match cli.command {
         Command::Version { jar } => match scan_jar(&jar) {
             Ok(report) => write_stdout(&render_version(&report)),
-            Err(err) => {
-                eprintln!("error: {err:#}");
-                ExitCode::from(2)
-            }
+            Err(err) => fail(&err),
         },
         Command::List { jar, classes_only } => match read_index(&jar) {
             Ok(report) => {
-                if report.duplicate_names {
-                    eprintln!(
-                        "warning: {} has duplicate entry names; each name is listed once",
-                        jar.display()
-                    );
-                }
-                for (name, reason) in &report.invalid {
-                    eprintln!("warning: {name}: {reason}");
-                }
+                warn(&report, &jar, "each name is listed once");
                 write_stdout(&render_list(&report, classes_only))
             }
-            Err(err) => {
-                eprintln!("error: {err:#}");
-                ExitCode::from(2)
+            Err(err) => fail(&err),
+        },
+        Command::Info { jar } => match read_index(&jar) {
+            Ok(report) => {
+                warn(&report, &jar, "counts and sizes cover one entry per name");
+                write_stdout(&render_info(&report))
             }
+            Err(err) => fail(&err),
         },
     }
 }
