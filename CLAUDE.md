@@ -8,3 +8,4 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - Speed matters: `version` reads only 8 bytes per class, `find` reads only the ZIP's central directory.
 - Never panic on bad JARs; in folder scans, warn and skip the bad JAR.
 - Check output against `javap -v`, `jar tf` and `unzip -v`.
+- Comments only for very important, non-obvious *why* (JVM quirks, safety limits); no doc comments that restate the code.
