@@ -93,7 +93,10 @@ fn truncated_jar() {
 fn version_flag() {
     let out = jarscope().arg("--version").output().expect("run");
     assert_eq!(out.status.code(), Some(0));
-    assert_eq!(String::from_utf8_lossy(&out.stdout), "jarscope 0.1.0\n");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        format!("jarscope {}\n", env!("CARGO_PKG_VERSION"))
+    );
 }
 
 #[test]
