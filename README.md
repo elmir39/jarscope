@@ -182,7 +182,10 @@ Guava 33.5.0 (1,961 classes):
 |---|---|---|
 | `jarscope version guava.jar` (all classes) | 9.4 ms | 2.3 MiB |
 | `jarscope list guava.jar` | 1.7 ms | 2.6 MiB |
-| `jarscope info guava.jar` | 1.7 ms | — |
+| `jarscope info guava.jar` | 2.0 ms | 2.6 MiB |
+| `jarscope find <exact name> guava.jar` | 1.7 ms | 3.2 MiB |
+| `unzip -Z1 guava.jar` (list) | 3.1 ms | 2.3 MiB |
+| `unzip -v guava.jar` (info) | 4.9 ms | 2.4 MiB |
 | `jar tf guava.jar` | 45.3 ms | 42.1 MiB |
 | `javap -v` on one class | 144 ms | 73 MiB |
 | `javap -v` on all 1,961 classes | 1.5 s | 193 MiB |
@@ -191,12 +194,14 @@ Finding `org.slf4j.Logger` in the 800 JARs of `~/.m2` (7 hits):
 
 | Command | Time |
 |---|---|
-| `jarscope find org.slf4j.Logger ~/.m2` | 39 ms ± 2 ms |
-| `jarscope find --nested org.slf4j.Logger ~/.m2` | 39 ms ± 2 ms |
-| loop of `unzip -Z1` per JAR | 4.7 s |
-| loop of `jar tf` per JAR | 32 s |
+| `jarscope find org.slf4j.Logger ~/.m2` | 24 ms ± 1 ms |
+| `jarscope find --nested org.slf4j.Logger ~/.m2` | 24 ms ± 1 ms |
+| loop of `unzip -Z1` per JAR | 3.4 s (0.84 s with 10 in parallel) |
+| loop of `jar tf` per JAR | 33 s |
 
-On `~/.gradle` (1,626 JARs among 35k files) `find` takes about 0.33 s; about 0.24 s of that is walking the folder.
+On `~/.gradle` (1,626 JARs among 35k files) `find` takes about 0.26 s; about 0.22 s of that is walking the folder.
+
+jarscope is faster than `unzip` on time everywhere except tiny-JAR startup (+0.2 ms). Memory is equal on normal JARs, but `unzip` streams the central directory and uses far less on huge JARs (2.4 MiB vs about 20 MiB for 50k entries).
 
 Checking 800 JARs, one process per JAR: `jarscope version` takes 1.7 s; `jar tf` (which
 only lists entries) takes 30 s.
