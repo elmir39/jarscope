@@ -277,3 +277,172 @@ fn info_without_manifest() {
         "{text}"
     );
 }
+
+fn find_tree() -> (TempDir, String, String) {
+    let dir = TempDir::new().expect("tempdir");
+    let a = make_jar(
+        dir.path(),
+        "a.jar",
+        &[("com/foo/Bar.class", class_bytes(0, 52))],
+    );
+    let b = make_jar(
+        dir.path(),
+        "b.jar",
+        &[
+            ("com/foo/Bar.class", class_bytes(0, 52)),
+            ("com/foo/BarService.class", class_bytes(0, 52)),
+        ],
+    );
+    make_jar(
+        dir.path(),
+        "c.jar",
+        &[("com/Other.class", class_bytes(0, 52))],
+    );
+    (dir, a.display().to_string(), b.display().to_string())
+}
+
+#[test]
+fn find_found_prints_paths() {
+    let (dir, a, b) = find_tree();
+    let out = jarscope()
+        .args(["find", "com.foo.Bar"])
+        .arg(dir.path())
+        .output()
+        .expect("run");
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), format!("{a}\n{b}\n"));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.starts_with("2 matches in 3 jars ("), "{err}");
+}
+
+#[test]
+fn find_pattern_prints_classes() {
+    let (dir, _, b) = find_tree();
+    let out = jarscope()
+        .args(["find", "com.foo.*Service"])
+        .arg(dir.path())
+        .output()
+        .expect("run");
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        format!("{b}\n  com.foo.BarService\n")
+    );
+}
+
+#[test]
+fn find_not_found_exits_1() {
+    let (dir, _, _) = find_tree();
+    let out = jarscope()
+        .args(["find", "com.Nope"])
+        .arg(dir.path())
+        .output()
+        .expect("run");
+    assert_eq!(out.status.code(), Some(1));
+    assert!(out.stdout.is_empty());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.starts_with("0 matches in 3 jars ("), "{err}");
+}
+
+#[test]
+fn find_fatal_errors_exit_2() {
+    let dir = TempDir::new().expect("tempdir");
+    let txt = dir.path().join("x.txt");
+    std::fs::write(&txt, b"not a zip").expect("write");
+    let cases: Vec<(&str, std::path::PathBuf)> = vec![
+        ("", dir.path().to_path_buf()),
+        (".class", dir.path().to_path_buf()),
+        ("com.A", dir.path().join("missing")),
+        ("com.A", txt),
+    ];
+    for (q, path) in cases {
+        let out = jarscope()
+            .args(["find", q])
+            .arg(&path)
+            .output()
+            .expect("run");
+        assert_eq!(out.status.code(), Some(2), "{q:?} {path:?}");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(err.starts_with("error: "), "{err}");
+    }
+}
+
+#[test]
+fn find_corrupt_jar_warns_and_skips() {
+    let (dir, a, b) = find_tree();
+    std::fs::write(dir.path().join("bad.jar"), b"garbage garbage").expect("write");
+    let out = jarscope()
+        .args(["find", "com.foo.Bar"])
+        .arg(dir.path())
+        .output()
+        .expect("run");
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), format!("{a}\n{b}\n"));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("warning: "), "{err}");
+    assert!(err.contains(", 1 skipped ("), "{err}");
+
+    let out = jarscope()
+        .args(["find", "com.Nope"])
+        .arg(dir.path())
+        .output()
+        .expect("run");
+    assert_eq!(out.status.code(), Some(1));
+}
+
+#[test]
+fn find_nested_end_to_end() {
+    let dir = TempDir::new().expect("tempdir");
+    let inner = common::jar_bytes(&[("com/In.class", class_bytes(0, 52))]);
+    let outer = make_jar(dir.path(), "outer.jar", &[("META-INF/jars/in.jar", inner)]);
+    let out = jarscope()
+        .args(["find", "--nested", "com.In"])
+        .arg(dir.path())
+        .output()
+        .expect("run");
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        format!("{}!/META-INF/jars/in.jar\n", outer.display())
+    );
+    let out = jarscope()
+        .args(["find", "com.In"])
+        .arg(dir.path())
+        .output()
+        .expect("run");
+    assert_eq!(out.status.code(), Some(1));
+}
+
+#[test]
+fn find_help_works() {
+    let out = jarscope().args(["find", "--help"]).output().expect("run");
+    assert_eq!(out.status.code(), Some(0));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("--nested"));
+}
+
+#[test]
+fn find_closed_stdout_and_stderr_do_not_panic() {
+    use std::process::{Command as Std, Stdio};
+    let dir = TempDir::new().expect("tempdir");
+    for i in 0..200 {
+        make_jar(
+            dir.path(),
+            &format!("j{i}.jar"),
+            &[("com/A.class", class_bytes(0, 52))],
+        );
+        std::fs::write(dir.path().join(format!("bad{i}.jar")), b"garbage").expect("write");
+    }
+    let bin = assert_cmd::cargo::cargo_bin("jarscope");
+    let mut child = Std::new(bin)
+        .args(["find", "com.A"])
+        .arg(dir.path())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn");
+    drop(child.stdout.take());
+    drop(child.stderr.take());
+    let status = child.wait().expect("wait");
+    assert_ne!(status.code(), Some(101));
+    assert!(status.code().is_some());
+}

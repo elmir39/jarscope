@@ -1,4 +1,7 @@
+use std::time::Duration;
+
 use crate::classfile::java_version;
+use crate::find::{FindReport, Location, Query};
 use crate::jar::JarReport;
 use crate::names::{class_name, sort_classes, sort_for_list};
 
@@ -233,6 +236,46 @@ pub fn render_info(report: &JarReport) -> String {
         out.push_str(&format!("{:<width$}{v}\n", format!("{l}:")));
     }
     out
+}
+
+pub fn render_find(report: &FindReport, query: &Query) -> String {
+    let mut out = String::new();
+    for m in &report.matches {
+        out.push_str(&m.path);
+        out.push('\n');
+        if query.is_pattern() {
+            for c in &m.classes {
+                out.push_str("  ");
+                out.push_str(&c.name);
+                if c.location != Location::Base {
+                    out.push_str(&format!(" ({})", c.location));
+                }
+                out.push('\n');
+            }
+        }
+    }
+    out
+}
+
+pub fn render_find_summary(report: &FindReport, elapsed: Duration) -> String {
+    let mut out = format!(
+        "{} in {}",
+        count(report.matches.len(), "match", "matches"),
+        count(report.jars, "jar", "jars")
+    );
+    if report.skipped > 0 {
+        out.push_str(&format!(", {} skipped", thousands(report.skipped as u64)));
+    }
+    out.push_str(&format!(" ({:.2} s)\n", elapsed.as_secs_f64()));
+    out
+}
+
+fn count(n: usize, one: &str, many: &str) -> String {
+    format!(
+        "{} {}",
+        thousands(n as u64),
+        if n == 1 { one } else { many }
+    )
 }
 
 #[cfg(test)]
@@ -504,5 +547,88 @@ Uncompressed:           2.0 KB (2,005 bytes)
     fn info_trailing_space_multi_release_is_false() {
         let r = with_manifest(&[("Multi-Release", "true ")]);
         assert!(render_info(&r).starts_with("Multi-Release:  false\n"));
+    }
+
+    fn jm(path: &str, classes: &[(&str, Location)]) -> crate::find::JarMatch {
+        crate::find::JarMatch {
+            path: path.to_string(),
+            classes: classes
+                .iter()
+                .map(|(n, l)| crate::find::ClassLocation {
+                    name: n.to_string(),
+                    location: *l,
+                })
+                .collect(),
+        }
+    }
+
+    fn report(matches: Vec<crate::find::JarMatch>, jars: usize, skipped: usize) -> FindReport {
+        FindReport {
+            matches,
+            jars,
+            skipped,
+            ..FindReport::default()
+        }
+    }
+
+    #[test]
+    fn find_exact_prints_paths_only() {
+        let q = Query::parse("com.foo.Bar").expect("query");
+        let r = report(
+            vec![
+                jm("a.jar", &[("com.foo.Bar", Location::Base)]),
+                jm("b.jar", &[]),
+            ],
+            2,
+            0,
+        );
+        assert_eq!(render_find(&r, &q), "a.jar\nb.jar\n");
+    }
+
+    #[test]
+    fn find_pattern_lists_classes_with_locations() {
+        let q = Query::parse("com.foo.*Service").expect("query");
+        let r = report(
+            vec![jm(
+                "a.jar!/META-INF/jars/in.jar",
+                &[
+                    ("com.foo.UserService", Location::Base),
+                    ("com.foo.UserService", Location::Versioned(17)),
+                    ("com.foo.WebService", Location::BootInf),
+                ],
+            )],
+            1,
+            0,
+        );
+        assert_eq!(
+            render_find(&r, &q),
+            "a.jar!/META-INF/jars/in.jar\n  com.foo.UserService\n  com.foo.UserService (META-INF/versions/17)\n  com.foo.WebService (BOOT-INF/classes)\n"
+        );
+    }
+
+    #[test]
+    fn find_no_matches_is_empty() {
+        let q = Query::parse("*.X").expect("query");
+        assert_eq!(render_find(&report(vec![], 3, 0), &q), "");
+    }
+
+    #[test]
+    fn find_summary_forms() {
+        let ms = |s: f64| Duration::from_secs_f64(s);
+        let one = report(vec![jm("a.jar", &[])], 1, 0);
+        assert_eq!(
+            render_find_summary(&one, ms(0.0)),
+            "1 match in 1 jar (0.00 s)\n"
+        );
+        let many = report(vec![jm("a", &[]), jm("b", &[])], 1200, 0);
+        assert_eq!(
+            render_find_summary(&many, ms(0.123)),
+            "2 matches in 1,200 jars (0.12 s)\n"
+        );
+        let none = report(vec![], 800, 2);
+        assert_eq!(
+            render_find_summary(&none, ms(4.7)),
+            "0 matches in 800 jars, 2 skipped (4.70 s)\n"
+        );
     }
 }
