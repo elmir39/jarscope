@@ -6,7 +6,9 @@ use common::{
     break_local_header_bytes, break_local_headers, class_bytes, jar_bytes, make_jar,
     make_jar_with_manifest, manifest_bytes, stored_jar_bytes,
 };
-use jarscope::find::{ClassLocation, JarMatch, JarSearch, Location, Query, search_jar};
+use jarscope::find::{
+    ClassLocation, JarMatch, JarSearch, Location, Query, find, find_jars, search_jar,
+};
 use tempfile::TempDir;
 
 fn class() -> Vec<u8> {
@@ -361,5 +363,152 @@ fn empty_and_non_zip_files_are_not_valid() {
     for path in [empty, text] {
         let msg = search_err(&path);
         assert!(msg.contains("is not a valid JAR/ZIP file"), "{msg}");
+    }
+}
+
+fn jar(dir: &Path, rel: &str, class_entry: &str) -> PathBuf {
+    let path = dir.join(rel);
+    std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+    std::fs::write(&path, jar_bytes(&[(class_entry, class())])).expect("write jar");
+    path
+}
+
+fn rel(root: &Path, jars: &[PathBuf]) -> Vec<String> {
+    jars.iter()
+        .map(|p| {
+            p.strip_prefix(root)
+                .expect("under root")
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect()
+}
+
+#[test]
+fn walk_finds_only_jar_files() {
+    let dir = TempDir::new().expect("tempdir");
+    let root = dir.path();
+    for r in [
+        "a.jar",
+        "sub/b.JAR",
+        "sub/deep/c.jar",
+        "x.jar/e.jar",
+        ".hidden/d.jar",
+    ] {
+        jar(root, r, "a/B.class");
+    }
+    std::fs::write(root.join("notes.txt"), b"hi").expect("write");
+    let (jars, warnings) = find_jars(root).expect("find_jars");
+    assert!(warnings.is_empty());
+    assert_eq!(
+        rel(root, &jars),
+        [
+            ".hidden/d.jar",
+            "a.jar",
+            "sub/b.JAR",
+            "sub/deep/c.jar",
+            "x.jar/e.jar"
+        ]
+    );
+}
+
+#[test]
+fn walk_order_is_bytewise() {
+    let dir = TempDir::new().expect("tempdir");
+    let root = dir.path();
+    jar(root, "p/a.jar", "a/B.class");
+    jar(root, "p-bin/a.jar", "a/B.class");
+    let (jars, _) = find_jars(root).expect("find_jars");
+    assert_eq!(rel(root, &jars), ["p-bin/a.jar", "p/a.jar"]);
+}
+
+#[cfg(unix)]
+#[test]
+fn symlinks_are_handled() {
+    use std::os::unix::fs::symlink;
+    let dir = TempDir::new().expect("tempdir");
+    let root = dir.path().join("root");
+    let real = jar(&root, "a.jar", "a/B.class");
+    symlink(&root, root.join("loop")).expect("symlink dir");
+    symlink(&real, root.join("link.jar")).expect("symlink file");
+    let (jars, _) = find_jars(&root).expect("find_jars");
+    assert_eq!(rel(&root, &jars), ["a.jar", "link.jar"]);
+    let report = find(&root, &Query::parse("a.B").expect("query"), false).expect("find");
+    assert_eq!(report.matches.len(), 2);
+
+    let via = dir.path().join("via");
+    symlink(&root, &via).expect("symlink root");
+    let (jars, _) = find_jars(&via).expect("find_jars");
+    assert_eq!(jars.len(), 2);
+}
+
+#[cfg(unix)]
+#[test]
+fn unreadable_subdirectory_is_a_warning() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = TempDir::new().expect("tempdir");
+    let root = dir.path();
+    jar(root, "a.jar", "a/B.class");
+    let locked = root.join("locked");
+    std::fs::create_dir(&locked).expect("mkdir");
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+    let readable = std::fs::read_dir(&locked).is_ok();
+    let result = find_jars(root);
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    if readable {
+        return;
+    }
+    let (jars, warnings) = result.expect("find_jars");
+    assert_eq!(rel(root, &jars), ["a.jar"]);
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert!(warnings[0].contains("locked"), "{warnings:?}");
+}
+
+#[test]
+fn single_file_root() {
+    let dir = TempDir::new().expect("tempdir");
+    let good = jar(dir.path(), "a.jar", "a/B.class");
+    let query = Query::parse("a.B").expect("query");
+    let report = find(&good, &query, false).expect("find");
+    assert_eq!((report.matches.len(), report.jars), (1, 1));
+
+    let bad = write(dir.path(), "bad.txt", b"nope".to_vec());
+    assert!(find(&bad, &query, false).is_err());
+    assert!(find(&dir.path().join("missing"), &query, false).is_err());
+}
+
+#[test]
+fn corrupt_jar_is_skipped_with_warning() {
+    let dir = TempDir::new().expect("tempdir");
+    let root = dir.path();
+    jar(root, "good.jar", "a/B.class");
+    write(root, "bad.jar", b"not a zip".to_vec());
+    let query = Query::parse("a.B").expect("query");
+    let report = find(root, &query, false).expect("find");
+    assert_eq!((report.jars, report.skipped), (2, 1));
+    assert_eq!(report.matches.len(), 1);
+    assert_eq!(report.warnings.len(), 1);
+    assert!(
+        report.warnings[0].contains("bad.jar"),
+        "{:?}",
+        report.warnings
+    );
+}
+
+#[test]
+fn parallel_results_are_deterministic() {
+    let dir = TempDir::new().expect("tempdir");
+    let root = dir.path();
+    for i in 0..40 {
+        jar(root, &format!("d{}/j{i:02}.jar", i % 5), "a/B.class");
+    }
+    let query = Query::parse("a.B").expect("query");
+    let first = find(root, &query, false).expect("find");
+    let sorted: Vec<_> = first.matches.iter().map(|m| m.path.clone()).collect();
+    let mut expect = sorted.clone();
+    expect.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+    assert_eq!(sorted, expect);
+    for _ in 0..5 {
+        assert_eq!(find(root, &query, false).expect("find"), first);
     }
 }

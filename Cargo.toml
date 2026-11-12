@@ -13,6 +13,8 @@ include = ["/src", "/Cargo.toml", "/Cargo.lock", "/README.md", "/LICENSE"]
 [dependencies]
 anyhow = "1.0.104"
 clap = { version = "4.6.7", features = ["derive"] }
+rayon = "1.12.0"
+walkdir = "2.5.0"
 zip = { version = "9.5.1", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 
 [dev-dependencies]

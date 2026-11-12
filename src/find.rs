@@ -1,8 +1,11 @@
 use std::fmt;
+use std::fs;
 use std::io::{self, Cursor, Read, Seek};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
+use rayon::prelude::*;
+use walkdir::WalkDir;
 use zip::ZipArchive;
 
 use crate::jar::{VERSIONS_PREFIX, open, parse_release};
@@ -123,6 +126,84 @@ pub fn search_jar(path: &Path, query: &Query, nested: bool) -> Result<JarSearch>
         nested,
         &Limits::DEFAULT,
     ))
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FindReport {
+    pub matches: Vec<JarMatch>,
+    pub warnings: Vec<String>,
+    pub jars: usize,
+    pub skipped: usize,
+}
+
+fn has_jar_extension(path: &Path) -> bool {
+    let name = path.as_os_str().as_encoded_bytes();
+    name.len() >= 4 && name[name.len() - 4..].eq_ignore_ascii_case(b".jar")
+}
+
+pub fn find_jars(root: &Path) -> Result<(Vec<PathBuf>, Vec<String>)> {
+    let meta = fs::metadata(root).with_context(|| format!("cannot read {}", root.display()))?;
+    if meta.is_file() {
+        return Ok((vec![root.to_path_buf()], Vec::new()));
+    }
+    let mut jars = Vec::new();
+    let mut warnings = Vec::new();
+    for entry in WalkDir::new(root) {
+        match entry {
+            Ok(entry) => {
+                let kind = entry.file_type();
+                let is_file = kind.is_file()
+                    || (kind.is_symlink() && fs::metadata(entry.path()).is_ok_and(|m| m.is_file()));
+                if is_file && has_jar_extension(entry.path()) {
+                    jars.push(entry.into_path());
+                }
+            }
+            Err(err) if err.depth() == 0 => {
+                return Err(err).with_context(|| format!("cannot read {}", root.display()));
+            }
+            Err(err) => warnings.push(match err.path() {
+                Some(path) => match err.io_error() {
+                    Some(io) => format!("cannot read {}: {io}", path.display()),
+                    None => format!("cannot read {}: {err}", path.display()),
+                },
+                None => err.to_string(),
+            }),
+        }
+    }
+    jars.sort_by(|a, b| {
+        a.as_os_str()
+            .as_encoded_bytes()
+            .cmp(b.as_os_str().as_encoded_bytes())
+    });
+    Ok((jars, warnings))
+}
+
+pub fn find(root: &Path, query: &Query, nested: bool) -> Result<FindReport> {
+    let (paths, warnings) = find_jars(root)?;
+    let single_file = fs::metadata(root).is_ok_and(|m| m.is_file());
+    let results = paths
+        .par_iter()
+        .map(|path| search_jar(path, query, nested))
+        .collect::<Vec<_>>();
+    let mut report = FindReport {
+        warnings,
+        jars: paths.len(),
+        ..FindReport::default()
+    };
+    for result in results {
+        match result {
+            Ok(search) => {
+                report.matches.extend(search.matches);
+                report.warnings.extend(search.warnings);
+            }
+            Err(err) if single_file => return Err(err),
+            Err(err) => {
+                report.skipped += 1;
+                report.warnings.push(format!("{err:#}"));
+            }
+        }
+    }
+    Ok(report)
 }
 
 struct Limits {
