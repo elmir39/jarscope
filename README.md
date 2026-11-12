@@ -180,9 +180,9 @@ Guava 33.5.0 (1,961 classes):
 
 | Command | Time | Peak memory |
 |---|---|---|
-| `jarscope version guava.jar` (all classes) | 10 ms | 2.3 MiB |
-| `jarscope list guava.jar` | 2.9 ms | 2.6 MiB |
-| `jarscope info guava.jar` | 2.8 ms | — |
+| `jarscope version guava.jar` (all classes) | 9.4 ms | 2.3 MiB |
+| `jarscope list guava.jar` | 1.7 ms | 2.6 MiB |
+| `jarscope info guava.jar` | 1.7 ms | — |
 | `jar tf guava.jar` | 45.3 ms | 42.1 MiB |
 | `javap -v` on one class | 144 ms | 73 MiB |
 | `javap -v` on all 1,961 classes | 1.5 s | 193 MiB |
@@ -191,12 +191,12 @@ Finding `org.slf4j.Logger` in the 800 JARs of `~/.m2` (7 hits):
 
 | Command | Time |
 |---|---|
-| `jarscope find org.slf4j.Logger ~/.m2` | 254 ms ± 7 ms |
-| `jarscope find --nested org.slf4j.Logger ~/.m2` | 251 ms ± 4 ms |
+| `jarscope find org.slf4j.Logger ~/.m2` | 39 ms ± 2 ms |
+| `jarscope find --nested org.slf4j.Logger ~/.m2` | 39 ms ± 2 ms |
 | loop of `unzip -Z1` per JAR | 4.7 s |
 | loop of `jar tf` per JAR | 32 s |
 
-On `~/.gradle` (1,626 JARs, 35k files) `find` takes 1.0 s, mostly the directory walk.
+On `~/.gradle` (1,626 JARs among 35k files) `find` takes about 0.33 s; about 0.24 s of that is walking the folder.
 
 Checking 800 JARs, one process per JAR: `jarscope version` takes 1.7 s; `jar tf` (which
 only lists entries) takes 30 s.

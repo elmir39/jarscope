@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::fs::File;
-use std::io::{Read, Seek};
+use std::io::{BufReader, Read, Seek};
 use std::path::Path;
 
 use anyhow::Context;
@@ -114,9 +114,11 @@ impl JarReport {
     }
 }
 
-pub(crate) fn open(path: &Path) -> anyhow::Result<ZipArchive<File>> {
+pub(crate) fn open(path: &Path) -> anyhow::Result<ZipArchive<BufReader<File>>> {
     let file = File::open(path).with_context(|| format!("cannot open {}", path.display()))?;
-    ZipArchive::new(file).with_context(|| format!("{} is not a valid JAR/ZIP file", path.display()))
+    // Unbuffered File means one syscall per small central-directory read; threads then contend in the kernel.
+    ZipArchive::new(BufReader::new(file))
+        .with_context(|| format!("{} is not a valid JAR/ZIP file", path.display()))
 }
 
 pub fn read_index(path: &Path) -> anyhow::Result<JarReport> {
