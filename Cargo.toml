@@ -1,6 +1,6 @@
 [package]
 name = "jarscope"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 description = "Fast JAR inspector CLI in Rust: Java version, contents, manifest and class search, no JVM needed."
 license = "MIT"
