@@ -1,11 +1,10 @@
 #![allow(dead_code)]
 
-use std::fs::File;
-use std::io::Write;
+use std::io::{Cursor, Write};
 use std::path::{Path, PathBuf};
 
 use zip::write::SimpleFileOptions;
-use zip::{CompressionMethod, ZipWriter};
+use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
 pub fn class_bytes(minor: u16, major: u16) -> Vec<u8> {
     let mut v = vec![0xCA, 0xFE, 0xBA, 0xBE];
@@ -26,9 +25,21 @@ pub fn manifest_bytes(attrs: &[(&str, &str)]) -> Vec<u8> {
 
 pub fn make_jar(dir: &Path, name: &str, entries: &[(&str, Vec<u8>)]) -> PathBuf {
     let path = dir.join(name);
-    let file = File::create(&path).expect("create jar file");
-    let mut zip = ZipWriter::new(file);
-    let opts = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+    std::fs::write(&path, jar_bytes(entries)).expect("write jar file");
+    path
+}
+
+pub fn jar_bytes(entries: &[(&str, Vec<u8>)]) -> Vec<u8> {
+    jar_bytes_with(entries, CompressionMethod::Deflated)
+}
+
+pub fn stored_jar_bytes(entries: &[(&str, Vec<u8>)]) -> Vec<u8> {
+    jar_bytes_with(entries, CompressionMethod::Stored)
+}
+
+fn jar_bytes_with(entries: &[(&str, Vec<u8>)], method: CompressionMethod) -> Vec<u8> {
+    let mut zip = ZipWriter::new(Cursor::new(Vec::new()));
+    let opts = SimpleFileOptions::default().compression_method(method);
     for (entry, data) in entries {
         if entry.ends_with('/') {
             zip.add_directory(*entry, opts).expect("add directory");
@@ -37,8 +48,38 @@ pub fn make_jar(dir: &Path, name: &str, entries: &[(&str, Vec<u8>)]) -> PathBuf 
             zip.write_all(data).expect("write entry");
         }
     }
-    zip.finish().expect("finish jar");
-    path
+    zip.finish().expect("finish jar").into_inner()
+}
+
+// Only the central directory stays readable: `ZipArchive::new` still opens the result, but
+// `by_index` fails. Build it from stored entries whose data can't contain `PK\x03\x04`.
+pub fn break_local_header_bytes(bytes: &mut [u8]) -> usize {
+    let sig = b"PK\x03\x04";
+    let mut count = 0;
+    let mut i = 0;
+    while i + sig.len() <= bytes.len() {
+        if &bytes[i..i + sig.len()] == sig {
+            bytes[i + 2..i + sig.len()].copy_from_slice(&[0, 0]);
+            count += 1;
+            i += sig.len();
+        } else {
+            i += 1;
+        }
+    }
+    count
+}
+
+pub fn break_local_headers(path: &Path) {
+    let mut bytes = std::fs::read(path).expect("read jar");
+    let entries = ZipArchive::new(Cursor::new(&bytes))
+        .expect("open jar")
+        .len();
+    assert_eq!(
+        break_local_header_bytes(&mut bytes),
+        entries,
+        "expected one local header signature per entry"
+    );
+    std::fs::write(path, bytes).expect("write jar");
 }
 
 pub fn make_jar_with_manifest(

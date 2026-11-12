@@ -114,7 +114,7 @@ impl JarReport {
     }
 }
 
-fn open(path: &Path) -> anyhow::Result<ZipArchive<File>> {
+pub(crate) fn open(path: &Path) -> anyhow::Result<ZipArchive<File>> {
     let file = File::open(path).with_context(|| format!("cannot open {}", path.display()))?;
     ZipArchive::new(file).with_context(|| format!("{} is not a valid JAR/ZIP file", path.display()))
 }
