@@ -1,4 +1,5 @@
 pub mod classfile;
+pub mod find;
 pub mod jar;
 pub mod manifest;
 pub mod names;
