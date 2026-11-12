@@ -1,7 +1,8 @@
 # jarscope
 
 Fast JAR inspector for the command line. Answers questions about Java JAR files
-instantly, without starting a JVM.
+instantly, without starting a JVM: what Java a JAR needs, what is inside it, and which
+JAR in a whole folder contains a class.
 
 ```
 $ jarscope version guava-33.5.0-jre.jar
@@ -97,15 +98,80 @@ Compressed:      2.6 MB (2,610,717 bytes)
 Uncompressed:    6.7 MB (6,727,760 bytes)
 ```
 
+### `jarscope find <class> <dir>`
+
+Finds which JARs in a folder contain a class. It walks `<dir>` recursively and searches
+the JARs in parallel, reading only each ZIP central directory, so nothing is decompressed.
+`<dir>` can also be a single JAR. Results are sorted by path.
+
+```
+$ jarscope find org.slf4j.Logger ~/.m2
+~/.m2/repository/org/slf4j/slf4j-api/2.0.17/slf4j-api-2.0.17.jar
+~/.m2/wrapper/dists/apache-maven-3.9.11-bin/6mqf5t809d9geo83kj4ttckcbc/apache-maven-3.9.11/lib/slf4j-api-1.7.36.jar
+…
+7 matches in 800 jars (0.25 s)
+```
+
+The summary goes to stderr, so stdout is only the paths.
+
+**Names.** `org.slf4j.Logger`, `org/slf4j/Logger` and `org/slf4j/Logger.class` are the
+same query. A nested class can be written `Outer.Inner`, which also matches
+`Outer$Inner.class`.
+
+**Patterns.** `*` matches within one package segment; `**` matches across packages.
+A pattern lists the matching classes under each JAR:
+
+```
+$ jarscope find 'org.slf4j.*Factory' ~/.m2
+~/.m2/repository/org/slf4j/slf4j-api/2.0.17/slf4j-api-2.0.17.jar
+  org.slf4j.ILoggerFactory
+  org.slf4j.IMarkerFactory
+  org.slf4j.LoggerFactory
+  org.slf4j.MarkerFactory
+…
+7 matches in 800 jars (0.25 s)
+```
+
+Other examples: `'com.foo.*Service'` (one package), `'**.Logger'` (a `Logger` in any
+package), `'com.foo.**'` (everything under `com.foo`).
+
+**Where classes are found.** Besides the JAR root, `find` matches `META-INF/versions/N/`,
+`BOOT-INF/classes/` and `WEB-INF/classes/`. In pattern mode the location is shown as a
+suffix, like `module-info (META-INF/versions/9)`. `find` never reads the manifest, so
+versioned classes match even without `Multi-Release: true`.
+
+**`--nested`** also searches JARs inside JARs (`META-INF/jars/`, `META-INF/jarjar/`,
+`BOOT-INF/lib/`, `WEB-INF/lib/`), as used by Fabric, Spring Boot and WAR files. An inner
+JAR is shown as `outer.jar!/inner.jar`. Inner JARs are read into memory, so there are
+limits on size, depth and the total per JAR; when one is hit, a warning is printed instead
+of silently dropping results.
+
+```
+$ jarscope find --nested com.llamalad7.mixinextras.MixinExtrasBootstrap ~/Library/Application\ Support/minecraft
+~/Library/Application Support/minecraft/.fabric/processedMods/mixinextras-0.4.1-215bdc40eef77b8f.jar
+~/Library/Application Support/minecraft/libraries/net/fabricmc/fabric-loader/0.16.9/fabric-loader-0.16.9.jar!/META-INF/jars/mixinextras-fabric-0.4.1.jar
+2 matches in 94 jars (0.16 s)
+```
+
 ### Exit codes
 
-The same for `version`, `list` and `info`. Warnings (for example, a JAR with duplicate
-entry names) go to stderr.
+`version`, `list` and `info`:
 
 | Code | Meaning |
 |---|---|
 | 0 | Success (also when some classes are invalid; they are listed) |
 | 2 | Error: file missing, not a JAR/ZIP, empty or truncated |
+
+`find`:
+
+| Code | Meaning |
+|---|---|
+| 0 | At least one match |
+| 1 | No match |
+| 2 | Error: empty query, path missing or unreadable, or a single file that isn't a JAR |
+
+Warnings (for example, a JAR with duplicate entry names) go to stderr. In a folder scan, a
+bad JAR is warned about and skipped, and the scan continues.
 
 ## Performance
 
@@ -121,14 +187,24 @@ Guava 33.5.0 (1,961 classes):
 | `javap -v` on one class | 144 ms | 73 MiB |
 | `javap -v` on all 1,961 classes | 1.5 s | 193 MiB |
 
+Finding `org.slf4j.Logger` in the 800 JARs of `~/.m2` (7 hits):
+
+| Command | Time |
+|---|---|
+| `jarscope find org.slf4j.Logger ~/.m2` | 254 ms ± 7 ms |
+| `jarscope find --nested org.slf4j.Logger ~/.m2` | 251 ms ± 4 ms |
+| loop of `unzip -Z1` per JAR | 4.7 s |
+| loop of `jar tf` per JAR | 32 s |
+
+On `~/.gradle` (1,626 JARs, 35k files) `find` takes 1.0 s, mostly the directory walk.
+
 Checking 800 JARs, one process per JAR: `jarscope version` takes 1.7 s; `jar tf` (which
 only lists entries) takes 30 s.
 
-The release binary is about 830 KiB.
+The release binary is about 1.0 MiB.
 
 ## Roadmap
 
-- `find`: find which JARs in a folder contain a class, scanning in parallel
 - `--json` output for every command
 - Minecraft mod metadata (Fabric, Quilt, Forge, NeoForge)
 
