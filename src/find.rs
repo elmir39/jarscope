@@ -25,6 +25,7 @@ pub struct Query {
     pattern: String,
     dotted: bool,
     has_wildcard: bool,
+    tokens: Vec<Token>,
 }
 
 impl Query {
@@ -34,10 +35,13 @@ impl Query {
             bail!("empty class name");
         }
         let dotted = !trimmed.contains('/');
+        let pattern = trimmed.replace('/', ".");
+        let tokens = tokenize(pattern.as_bytes());
         Ok(Query {
-            pattern: trimmed.replace('/', "."),
+            pattern,
             dotted,
             has_wildcard: trimmed.contains('*'),
+            tokens,
         })
     }
 
@@ -46,11 +50,19 @@ impl Query {
     }
 
     pub fn matches(&self, class_name: &str) -> bool {
-        let pattern = self.pattern.as_bytes();
-        glob(pattern, class_name.as_bytes())
-            || (self.dotted
-                && class_name.contains('$')
-                && glob(pattern, class_name.replace('$', ".").as_bytes()))
+        let name = class_name.as_bytes();
+        if !self.has_wildcard {
+            let pattern = self.pattern.as_bytes();
+            return name.len() == pattern.len()
+                && (name == pattern
+                    || (self.dotted
+                        && name
+                            .iter()
+                            .zip(pattern)
+                            .all(|(&n, &p)| n == p || (n == b'$' && p == b'.'))));
+        }
+        glob(&self.tokens, name, false)
+            || (self.dotted && name.contains(&b'$') && glob(&self.tokens, name, true))
     }
 }
 
@@ -395,7 +407,7 @@ impl Search<'_> {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Token {
     Lit(u8),
     Star,
@@ -423,20 +435,24 @@ fn tokenize(pattern: &[u8]) -> Vec<Token> {
 }
 
 // One rolling row, O(pattern * name): a greedy "last star" matcher is wrong with two wildcard kinds.
-fn glob(pattern: &[u8], name: &[u8]) -> bool {
+fn glob(tokens: &[Token], name: &[u8], dollar_as_dot: bool) -> bool {
+    let at = |j: usize| match name[j] {
+        b'$' if dollar_as_dot => b'.',
+        c => c,
+    };
     let mut row = vec![false; name.len() + 1];
     row[0] = true;
-    for token in tokenize(pattern) {
+    for &token in tokens {
         match token {
             Token::Lit(c) => {
                 for j in (1..=name.len()).rev() {
-                    row[j] = row[j - 1] && name[j - 1] == c;
+                    row[j] = row[j - 1] && at(j - 1) == c;
                 }
                 row[0] = false;
             }
             Token::Star => {
                 for j in 1..=name.len() {
-                    row[j] = row[j] || (row[j - 1] && name[j - 1] != b'.');
+                    row[j] = row[j] || (row[j - 1] && at(j - 1) != b'.');
                 }
             }
             Token::DoubleStar => {
@@ -455,6 +471,21 @@ mod tests {
 
     fn q(s: &str) -> Query {
         Query::parse(s).unwrap()
+    }
+
+    #[test]
+    fn exact_fast_path() {
+        assert!(q("com.foo.Outer.Inner").matches("com.foo.Outer$Inner"));
+        assert!(q("com.foo.Outer$Inner").matches("com.foo.Outer$Inner"));
+        assert!(!q("com/foo/Outer/Inner").matches("com.foo.Outer$Inner"));
+        assert!(q("com/foo/Outer$Inner").matches("com.foo.Outer$Inner"));
+        assert!(!q("com.foo.Outer").matches("com.foo.Outer$Inner"));
+        assert!(!q("com.foo.Outer.Inner").matches("com.foo.Outer"));
+        assert!(q("a.b").matches("a$b"));
+        assert!(q("a.b").matches("a.b"));
+        assert!(!q("a$b").matches("a.b"));
+        assert!(!q("a.b").matches("a$c"));
+        assert!(!q("a.b").matches("a$$"));
     }
 
     #[test]
