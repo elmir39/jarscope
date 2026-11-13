@@ -1,3 +1,4 @@
+pub mod cdir;
 pub mod classfile;
 pub mod find;
 pub mod jar;
