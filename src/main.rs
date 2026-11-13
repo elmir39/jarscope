@@ -1,4 +1,4 @@
-use std::io::{self, Write};
+use std::io::{self, BufWriter, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Instant;
@@ -54,7 +54,14 @@ enum Command {
 
 fn write_stdout(text: &str, success: ExitCode) -> ExitCode {
     let mut out = io::stdout().lock();
-    match out.write_all(text.as_bytes()).and_then(|()| out.flush()) {
+    stdout_result(
+        out.write_all(text.as_bytes()).and_then(|()| out.flush()),
+        success,
+    )
+}
+
+fn stdout_result(result: io::Result<()>, success: ExitCode) -> ExitCode {
+    match result {
         Ok(()) => success,
         Err(e) if e.kind() == io::ErrorKind::BrokenPipe => success,
         Err(e) => {
@@ -90,7 +97,11 @@ fn main() -> ExitCode {
             Err(err) => fail(&err),
         },
         Command::List { jar, classes_only } => match read_names(&jar) {
-            Ok(names) => write_stdout(&render_list(&names, classes_only), ExitCode::SUCCESS),
+            Ok(names) => {
+                let mut out = BufWriter::new(io::stdout().lock());
+                let result = render_list(&mut out, &names, classes_only).and_then(|()| out.flush());
+                stdout_result(result, ExitCode::SUCCESS)
+            }
             Err(err) => fail(&err),
         },
         Command::Info { jar } => match read_info(&jar) {

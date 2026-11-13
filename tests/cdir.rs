@@ -248,6 +248,20 @@ fn empty_archive() {
     assert!(cd.is_empty());
     assert!(cd.next_entry().expect("read").is_none());
     assert!(cd.next_entry().expect("read").is_none());
+    assert_eq!(cd.variable_bytes(), 0);
+}
+
+#[test]
+fn variable_bytes_bound_names_extras_and_comments() {
+    let mut entries = small_raw();
+    entries[1].extra = extra_field(0xcafe, b"12345");
+    let bytes = raw_zip(&entries, &RawZip::default());
+    let mut cd = CentralDirectory::new(Cursor::new(&bytes)).expect("open");
+    assert_eq!(cd.variable_bytes(), 2 + 9 + 5 + 4 + 5);
+    cd.next_entry().expect("read");
+    assert_eq!(cd.variable_bytes(), 9 + 5 + 4 + 5);
+    while cd.next_entry().expect("read").is_some() {}
+    assert_eq!(cd.variable_bytes(), 0);
 }
 
 #[test]

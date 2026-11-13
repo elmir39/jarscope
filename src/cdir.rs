@@ -249,6 +249,13 @@ impl<R: Read + Seek> CentralDirectory<R> {
         self.count == 0
     }
 
+    // Raw name, extra and comment bytes still to come: an upper bound for ASCII and UTF-8 names.
+    pub fn variable_bytes(&self) -> u64 {
+        self.end
+            .saturating_sub(self.pos)
+            .saturating_sub(self.remaining.saturating_mul(CENTRAL_LEN as u64))
+    }
+
     pub fn into_inner(self) -> R {
         self.reader
     }

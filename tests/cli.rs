@@ -124,6 +124,29 @@ fn closed_stdout_does_not_panic() {
 }
 
 #[test]
+fn list_into_closed_stdout_exits_quietly() {
+    use std::process::{Command as Std, Stdio};
+    let dir = TempDir::new().expect("tempdir");
+    let names: Vec<String> = (0..5000)
+        .map(|i| format!("com/foo/Entry{i:05}.txt"))
+        .collect();
+    let entries: Vec<(&str, Vec<u8>)> = names.iter().map(|n| (n.as_str(), vec![])).collect();
+    let jar = make_jar(dir.path(), "a.jar", &entries);
+    let bin = assert_cmd::cargo::cargo_bin("jarscope");
+    let mut child = Std::new(bin)
+        .arg("list")
+        .arg(&jar)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn");
+    drop(child.stdout.take());
+    let out = child.wait_with_output().expect("wait");
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stderr), "");
+}
+
+#[test]
 fn list_prints_entries_in_order() {
     let dir = TempDir::new().expect("tempdir");
     let jar = make_jar(

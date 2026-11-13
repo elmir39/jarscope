@@ -1,3 +1,4 @@
+use std::io::{self, Write};
 use std::time::Duration;
 
 use crate::classfile::java_version;
@@ -135,28 +136,25 @@ pub fn render_version(report: &JarReport) -> String {
     sections.join("\n")
 }
 
-pub fn render_list(names: &EntryNames, classes_only: bool) -> String {
-    let mut out = String::new();
+pub fn render_list(out: &mut impl Write, names: &EntryNames, classes_only: bool) -> io::Result<()> {
     if classes_only {
         let mut classes: Vec<_> = names.iter().filter_map(class_name).collect();
         sort_classes(&mut classes);
         for c in &classes {
-            out.push_str(&c.name);
-            if let Some(r) = c.release {
-                out.push_str(&format!(" (META-INF/versions/{r})"));
+            match c.release {
+                Some(r) => writeln!(out, "{} (META-INF/versions/{r})", c.name)?,
+                None => writeln!(out, "{}", c.name)?,
             }
-            out.push('\n');
         }
     } else {
         let mut names: Vec<&str> = names.iter().collect();
         sort_for_list(&mut names);
-        out.reserve(names.iter().map(|n| n.len() + 1).sum());
         for n in names {
-            out.push_str(n);
-            out.push('\n');
+            out.write_all(n.as_bytes())?;
+            out.write_all(b"\n")?;
         }
     }
-    out
+    Ok(())
 }
 
 pub fn thousands(n: u64) -> String {
@@ -401,6 +399,12 @@ Invalid class files: 1
         ));
     }
 
+    fn list(names: &EntryNames, classes_only: bool) -> String {
+        let mut out = Vec::new();
+        render_list(&mut out, names, classes_only).unwrap();
+        String::from_utf8(out).unwrap()
+    }
+
     fn entries(names: &[&str]) -> EntryNames {
         let mut out = EntryNames::default();
         for n in names {
@@ -418,7 +422,7 @@ Invalid class files: 1
             "A.txt",
         ]);
         assert_eq!(
-            render_list(&r, false),
+            list(&r, false),
             "A.txt\ncom/foo/\ncom/foo/baz.txt\ncom/foo/bar/X.class\n"
         );
     }
@@ -433,7 +437,7 @@ Invalid class files: 1
             "META-INF/versions/9/module-info.class",
         ]);
         assert_eq!(
-            render_list(&r, true),
+            list(&r, true),
             "com.foo.Bar\nmodule-info (META-INF/versions/9)\ncom.foo.Bar (META-INF/versions/17)\n"
         );
     }
@@ -441,8 +445,8 @@ Invalid class files: 1
     #[test]
     fn list_empty() {
         let r = EntryNames::default();
-        assert_eq!(render_list(&r, false), "");
-        assert_eq!(render_list(&r, true), "");
+        assert_eq!(list(&r, false), "");
+        assert_eq!(list(&r, true), "");
     }
 
     #[test]

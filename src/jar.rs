@@ -113,6 +113,13 @@ pub struct EntryNames {
 }
 
 impl EntryNames {
+    // A hint only: failing to reserve is not an error, and both bounds come from a
+    // central directory already checked against the file size.
+    fn reserve(&mut self, text: u64, count: u64) {
+        let _ = self.text.try_reserve(usize::try_from(text).unwrap_or(0));
+        let _ = self.ends.try_reserve(usize::try_from(count).unwrap_or(0));
+    }
+
     pub fn push(&mut self, name: &str) {
         self.text.push_str(name);
         self.ends.push(self.text.len());
@@ -179,6 +186,7 @@ pub fn read_info(path: &Path) -> anyhow::Result<JarInfo> {
 pub fn read_names(path: &Path) -> anyhow::Result<EntryNames> {
     let mut cd = open_cdir(path)?;
     let mut names = EntryNames::default();
+    names.reserve(cd.variable_bytes(), cd.len());
     while let Some(entry) = cd.next_entry().with_context(|| invalid_jar(path))? {
         names.push(entry.name);
     }
