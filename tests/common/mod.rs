@@ -122,6 +122,7 @@ pub const ZIP64_MARK: u32 = 0xFFFF_FFFF;
 
 // One stored entry for `raw_zip`. `zip64` writes 0xFFFFFFFF sizes and offset in the central
 // header plus a 0x0001 extra field holding `zip64_values` (default: size, size, offset).
+// `flags` and `method` go into both headers as given; the data is written stored anyway.
 #[derive(Clone, Debug, Default)]
 pub struct RawEntry {
     pub name: Vec<u8>,
@@ -132,6 +133,8 @@ pub struct RawEntry {
     pub local_extra: Vec<u8>,
     pub zip64: bool,
     pub zip64_values: Option<Vec<u64>>,
+    pub flags: u16,
+    pub method: u16,
 }
 
 impl RawEntry {
@@ -141,6 +144,10 @@ impl RawEntry {
             data: data.as_ref().to_vec(),
             ..RawEntry::default()
         }
+    }
+
+    fn flag_bits(&self) -> u16 {
+        self.flags | if self.utf8 { 0x0800 } else { 0 }
     }
 }
 
@@ -221,8 +228,8 @@ pub fn raw_zip(entries: &[RawEntry], opts: &RawZip) -> Vec<u8> {
 
         zip.extend_from_slice(b"PK\x03\x04");
         zip.extend_from_slice(&(if e.zip64 { 45u16 } else { 20 }).to_le_bytes());
-        zip.extend_from_slice(&(if e.utf8 { 0x0800u16 } else { 0 }).to_le_bytes());
-        zip.extend_from_slice(&0u16.to_le_bytes());
+        zip.extend_from_slice(&e.flag_bits().to_le_bytes());
+        zip.extend_from_slice(&e.method.to_le_bytes());
         zip.extend_from_slice(&[0, 0, 0x21, 0]);
         zip.extend_from_slice(&crc32(&e.data).to_le_bytes());
         zip.extend_from_slice(&local_size);
@@ -250,8 +257,8 @@ pub fn raw_zip(entries: &[RawEntry], opts: &RawZip) -> Vec<u8> {
         zip.extend_from_slice(b"PK\x01\x02");
         zip.extend_from_slice(&(if e.zip64 { 45u16 } else { 20 }).to_le_bytes());
         zip.extend_from_slice(&(if e.zip64 { 45u16 } else { 20 }).to_le_bytes());
-        zip.extend_from_slice(&(if e.utf8 { 0x0800u16 } else { 0 }).to_le_bytes());
-        zip.extend_from_slice(&0u16.to_le_bytes());
+        zip.extend_from_slice(&e.flag_bits().to_le_bytes());
+        zip.extend_from_slice(&e.method.to_le_bytes());
         zip.extend_from_slice(&[0, 0, 0x21, 0]);
         zip.extend_from_slice(&crc32(&e.data).to_le_bytes());
         zip.extend_from_slice(&size_field);

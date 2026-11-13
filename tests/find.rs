@@ -3,12 +3,14 @@ mod common;
 use std::path::{Path, PathBuf};
 
 use common::{
-    break_local_header_bytes, break_local_headers, class_bytes, jar_bytes, make_jar,
-    make_jar_with_manifest, manifest_bytes, stored_jar_bytes,
+    RawEntry, RawZip, break_local_header_bytes, break_local_headers, class_bytes, jar_bytes,
+    make_jar, make_jar_with_duplicate, make_jar_with_manifest, manifest_bytes, raw_zip,
+    stored_jar_bytes,
 };
 use jarscope::find::{
     ClassLocation, JarMatch, JarSearch, Location, Query, find, find_jars, search_jar,
 };
+use jarscope::render::render_find;
 use tempfile::TempDir;
 
 fn class() -> Vec<u8> {
@@ -511,4 +513,224 @@ fn parallel_results_are_deterministic() {
     for _ in 0..5 {
         assert_eq!(find(root, &query, false).expect("find"), first);
     }
+}
+
+fn printed(root: &Path, query: &str, nested: bool) -> String {
+    let query = Query::parse(query).expect("query");
+    render_find(&find(root, &query, nested).expect("find"), &query)
+}
+
+#[test]
+fn duplicate_class_is_printed_once() {
+    let dir = TempDir::new().expect("tempdir");
+    let jar = make_jar_with_duplicate(dir.path(), "dup.jar", class(), class());
+    let path = shown(&jar);
+    assert_eq!(printed(&jar, "a.A", false), format!("{path}\n"));
+    assert_eq!(printed(&jar, "a.*", false), format!("{path}\n  a.A\n"));
+    assert_eq!(
+        search(&jar, "a.A", false).matches,
+        [found(&path, &[("a.A", Location::Base)])]
+    );
+}
+
+// Renames `META-INF/jars/b.jar` to `META-INF/jars/a.jar` in place, as `make_jar_with_duplicate`.
+#[test]
+fn duplicate_nested_jar_is_searched_once_using_the_last_record() {
+    let dir = TempDir::new().expect("tempdir");
+    let mut bytes = stored_jar_bytes(&[
+        (
+            "META-INF/jars/a.jar",
+            stored_jar_bytes(&[("com/First.class", class())]),
+        ),
+        (
+            "META-INF/jars/b.jar",
+            stored_jar_bytes(&[("com/Last.class", class())]),
+        ),
+    ]);
+    let (from, to) = (b"META-INF/jars/b.jar", b"META-INF/jars/a.jar");
+    let at: Vec<_> = (0..=bytes.len() - from.len())
+        .filter(|&i| &bytes[i..i + from.len()] == from)
+        .collect();
+    assert_eq!(at.len(), 2, "one local and one central header");
+    for i in at {
+        bytes[i..i + to.len()].copy_from_slice(to);
+    }
+    let jar = write(dir.path(), "outer.jar", bytes);
+    assert_eq!(
+        printed(&jar, "**", true),
+        format!("{}!/META-INF/jars/a.jar\n  com.Last\n", shown(&jar))
+    );
+}
+
+const SCRIPT: &[u8] = b"#!/bin/sh\nexec java -jar \"$0\" \"$@\"\n";
+
+fn raw_class(name: &str) -> RawEntry {
+    RawEntry::new(name, class())
+}
+
+#[test]
+fn prepended_data_jar_is_found_at_top_level_and_nested() {
+    let dir = TempDir::new().expect("tempdir");
+    let prefixed = RawZip {
+        prefix: SCRIPT.to_vec(),
+        ..RawZip::default()
+    };
+    let inner = raw_zip(&[raw_class("com/In.class")], &prefixed);
+    let jar = write(
+        dir.path(),
+        "app.jar",
+        raw_zip(
+            &[
+                raw_class("BOOT-INF/classes/com/App.class"),
+                RawEntry::new("BOOT-INF/lib/in.jar", inner),
+            ],
+            &prefixed,
+        ),
+    );
+    let path = shown(&jar);
+    assert_eq!(
+        search(&jar, "com.App", false).matches,
+        [found(&path, &[("com.App", Location::BootInf)])]
+    );
+    let s = search(&jar, "com.*", true);
+    assert_eq!(
+        s.matches,
+        [
+            found(&path, &[("com.App", Location::BootInf)]),
+            found(
+                &format!("{path}!/BOOT-INF/lib/in.jar"),
+                &[("com.In", Location::Base)]
+            ),
+        ]
+    );
+    assert!(s.warnings.is_empty(), "{:?}", s.warnings);
+}
+
+#[test]
+fn zip64_jar_is_found_at_top_level_and_nested() {
+    let dir = TempDir::new().expect("tempdir");
+    let zip64 = RawZip {
+        zip64: true,
+        ..RawZip::default()
+    };
+    let entry = |e: RawEntry| RawEntry { zip64: true, ..e };
+    let inner = raw_zip(&[entry(raw_class("com/In.class"))], &zip64);
+    let jar = write(
+        dir.path(),
+        "big.jar",
+        raw_zip(
+            &[
+                entry(raw_class("com/Out.class")),
+                entry(RawEntry::new("META-INF/jars/in.jar", inner)),
+            ],
+            &zip64,
+        ),
+    );
+    let path = shown(&jar);
+    let s = search(&jar, "com.*", true);
+    assert_eq!(
+        s.matches,
+        [
+            found(&path, &[("com.Out", Location::Base)]),
+            found(
+                &format!("{path}!/META-INF/jars/in.jar"),
+                &[("com.In", Location::Base)]
+            ),
+        ]
+    );
+    assert!(s.warnings.is_empty(), "{:?}", s.warnings);
+}
+
+// The first record (`a/B.class`) parses; the second one's signature is broken.
+fn cut_jar() -> Vec<u8> {
+    let mut bytes = stored_jar_bytes(&[("a/B.class", class()), ("z/Z.class", class())]);
+    let sig = b"PK\x01\x02";
+    let at: Vec<_> = (0..=bytes.len() - sig.len())
+        .filter(|&i| &bytes[i..i + sig.len()] == sig)
+        .collect();
+    assert_eq!(at.len(), 2);
+    bytes[at[1] + 2] = 0;
+    bytes
+}
+
+#[test]
+fn central_directory_cut_in_the_middle_skips_the_jar() {
+    let dir = TempDir::new().expect("tempdir");
+    let good = jar(dir.path(), "good.jar", "a/B.class");
+    let bad = write(dir.path(), "bad.jar", cut_jar());
+    let msg = search_err(&bad);
+    assert_eq!(
+        msg,
+        format!(
+            "{} is not a valid JAR/ZIP file: truncated or corrupt central directory",
+            shown(&bad)
+        )
+    );
+
+    let report = find(dir.path(), &Query::parse("**").expect("query"), true).expect("find");
+    assert_eq!((report.jars, report.skipped), (2, 1));
+    assert_eq!(
+        report.matches,
+        [found(&shown(&good), &[("a.B", Location::Base)])]
+    );
+    assert_eq!(report.warnings, [msg]);
+}
+
+#[test]
+fn nested_central_directory_cut_in_the_middle_is_a_warning() {
+    let dir = TempDir::new().expect("tempdir");
+    let jar = make_jar(
+        dir.path(),
+        "outer.jar",
+        &[
+            ("a/Outer.class", class()),
+            ("META-INF/jars/cut.jar", cut_jar()),
+        ],
+    );
+    let s = search(&jar, "**", true);
+    assert_eq!(
+        s.matches,
+        [found(&shown(&jar), &[("a.Outer", Location::Base)])]
+    );
+    assert_eq!(
+        s.warnings,
+        [format!(
+            "{}!/META-INF/jars/cut.jar is not a valid JAR/ZIP file: truncated or corrupt central directory",
+            shown(&jar)
+        )]
+    );
+}
+
+#[test]
+fn nested_encrypted_or_unsupported_method_is_a_warning() {
+    let dir = TempDir::new().expect("tempdir");
+    let inner = || stored_jar_bytes(&[("com/In.class", class())]);
+    let jar = write(
+        dir.path(),
+        "outer.jar",
+        raw_zip(
+            &[
+                raw_class("com/Out.class"),
+                RawEntry {
+                    flags: 1,
+                    ..RawEntry::new("META-INF/jars/enc.jar", inner())
+                },
+                RawEntry {
+                    method: 12,
+                    ..RawEntry::new("META-INF/jars/m12.jar", inner())
+                },
+            ],
+            &RawZip::default(),
+        ),
+    );
+    let path = shown(&jar);
+    let s = search(&jar, "com.*", true);
+    assert_eq!(s.matches, [found(&path, &[("com.Out", Location::Base)])]);
+    assert_eq!(
+        s.warnings,
+        [
+            format!("cannot read {path}!/META-INF/jars/enc.jar: encrypted entry"),
+            format!("cannot read {path}!/META-INF/jars/m12.jar: unsupported compression method 12"),
+        ]
+    );
 }

@@ -1,14 +1,14 @@
 use std::fmt;
 use std::fs;
-use std::io::{self, Cursor, Read, Seek};
+use std::io::{Cursor, Read, Seek};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use rayon::prelude::*;
 use walkdir::WalkDir;
-use zip::ZipArchive;
 
-use crate::jar::{VERSIONS_PREFIX, open, parse_release};
+use crate::cdir::{CentralDirectory, EntryInfo, read_entry};
+use crate::jar::{VERSIONS_PREFIX, invalid_jar, open_cdir, parse_release};
 use crate::render::human_size;
 
 const BOOT_PREFIX: &str = "BOOT-INF/classes/";
@@ -129,15 +129,9 @@ pub struct JarSearch {
 }
 
 pub fn search_jar(path: &Path, query: &Query, nested: bool) -> Result<JarSearch> {
-    let mut archive = open(path)?;
+    let archive = open_cdir(path)?;
     let display = path.display().to_string();
-    Ok(search(
-        &mut archive,
-        &display,
-        query,
-        nested,
-        &Limits::DEFAULT,
-    ))
+    search(archive, &display, query, nested, &Limits::DEFAULT).with_context(|| invalid_jar(path))
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -255,12 +249,12 @@ struct Search<'a> {
 }
 
 fn search<R: Read + Seek>(
-    archive: &mut ZipArchive<R>,
+    archive: CentralDirectory<R>,
     display: &str,
     query: &Query,
     nested: bool,
     limits: &Limits,
-) -> JarSearch {
+) -> Result<JarSearch> {
     let mut search = Search {
         query,
         nested,
@@ -268,8 +262,8 @@ fn search<R: Read + Seek>(
         budget: Budget::default(),
         out: JarSearch::default(),
     };
-    search.archive(archive, display, 0);
-    search.out
+    search.archive(archive, display, 0)?;
+    Ok(search.out)
 }
 
 fn is_nested_jar(name: &str) -> bool {
@@ -285,48 +279,63 @@ fn class_key(c: &ClassLocation) -> (Location, &str, &str) {
 }
 
 impl Search<'_> {
-    // Without `nested` no entry is opened: only the central directory is read.
+    // Without `nested` no entry is opened: only the central directory is read. Nested JARs
+    // are read after the loop, so a directory that breaks halfway yields no nested matches.
     fn archive<R: Read + Seek>(
         &mut self,
-        archive: &mut ZipArchive<R>,
+        mut archive: CentralDirectory<R>,
         display: &str,
         depth: usize,
-    ) {
+    ) -> Result<()> {
         let mut classes = Vec::new();
         let mut candidates = Vec::new();
-        for (i, name) in archive.file_names().enumerate() {
-            let Ok(name) = name else { continue };
-            if let Some(class) = class_location(&name) {
+        while let Some(entry) = archive.next_entry()? {
+            if let Some(class) = class_location(entry.name) {
                 if self.query.matches(&class.name) {
                     classes.push(class);
                 }
-            } else if self.nested && is_nested_jar(&name) {
-                candidates.push((i, name.into_owned()));
+            } else if self.nested && is_nested_jar(entry.name) {
+                candidates.push(entry.to_info());
             }
         }
         if !classes.is_empty() {
             classes.sort_by(|a, b| class_key(a).cmp(&class_key(b)));
+            classes.dedup();
             self.out.matches.push(JarMatch {
                 path: display.to_string(),
                 classes,
             });
         }
-        candidates.sort_unstable_by(|a, b| a.1.cmp(&b.1));
-        for (i, name) in candidates {
-            let path = format!("{display}!/{name}");
-            if let Some(mut inner) = self.open_nested(archive, i, &path, depth + 1) {
-                self.archive(&mut inner, &path, depth + 1);
+        if candidates.is_empty() {
+            return Ok(());
+        }
+        // A duplicated name is searched once, using the last record, as the `zip` crate did.
+        candidates.reverse();
+        candidates.sort_by(|a, b| a.name.cmp(&b.name));
+        candidates.dedup_by(|a, b| a.name == b.name);
+        let mut reader = archive.into_inner();
+        for entry in &candidates {
+            let path = format!("{display}!/{}", entry.name);
+            let Some(bytes) = self.read_nested(&mut reader, entry, &path, depth + 1) else {
+                continue;
+            };
+            let searched = CentralDirectory::new(Cursor::new(bytes))
+                .and_then(|inner| self.archive(inner, &path, depth + 1));
+            if let Err(e) = searched {
+                let msg = format!("{path} is not a valid JAR/ZIP file: {e:#}");
+                self.out.warnings.push(msg);
             }
         }
+        Ok(())
     }
 
-    fn open_nested<R: Read + Seek>(
+    fn read_nested<R: Read + Seek>(
         &mut self,
-        archive: &mut ZipArchive<R>,
-        i: usize,
+        reader: &mut R,
+        entry: &EntryInfo,
         path: &str,
         depth: usize,
-    ) -> Option<ZipArchive<Cursor<Vec<u8>>>> {
+    ) -> Option<Vec<u8>> {
         let limits = self.limits;
         if self.budget.exhausted {
             return None;
@@ -338,10 +347,7 @@ impl Search<'_> {
             );
             return self.warn(msg);
         }
-        let declared = match archive.by_index_data(i) {
-            Ok(data) => data.size(),
-            Err(e) => return self.warn(format!("cannot read {path}: {e}")),
-        };
+        let declared = entry.size;
         if declared > limits.size {
             return self.warn(format!(
                 "{path}: declared size {} is over the {} limit, not searched",
@@ -365,13 +371,10 @@ impl Search<'_> {
         // The declared size is untrusted: don't reserve 256 MiB for an entry that holds a few bytes.
         let initial = declared.min(16 << 20);
         let mut bytes = Vec::with_capacity(usize::try_from(initial).unwrap_or(0));
-        let read = archive
-            .by_index(i)
-            .map_err(io::Error::from)
-            .and_then(|entry| entry.take(cap.saturating_add(1)).read_to_end(&mut bytes));
+        let read = read_entry(reader, entry, cap, &mut bytes);
         self.budget.bytes = self.budget.bytes.saturating_add(bytes.len() as u64);
         if let Err(e) = read {
-            return self.warn(format!("cannot read {path}: {e}"));
+            return self.warn(format!("cannot read {path}: {e:#}"));
         }
         if bytes.len() as u64 > cap {
             return if cap == limits.size {
@@ -383,10 +386,7 @@ impl Search<'_> {
                 self.exhaust_bytes(path)
             };
         }
-        match ZipArchive::new(Cursor::new(bytes)) {
-            Ok(inner) => Some(inner),
-            Err(e) => self.warn(format!("{path} is not a valid JAR/ZIP file: {e}")),
-        }
+        Some(bytes)
     }
 
     fn warn<T>(&mut self, msg: String) -> Option<T> {
@@ -586,8 +586,8 @@ mod tests {
     }
 
     fn run(outer: Vec<u8>, limits: &Limits) -> (Vec<String>, Vec<String>) {
-        let mut archive = ZipArchive::new(Cursor::new(outer)).unwrap();
-        let out = search(&mut archive, "o.jar", &q("**.X"), true, limits);
+        let archive = CentralDirectory::new(Cursor::new(outer)).unwrap();
+        let out = search(archive, "o.jar", &q("**.X"), true, limits).unwrap();
         let paths = out.matches.into_iter().map(|m| m.path).collect();
         (paths, out.warnings)
     }

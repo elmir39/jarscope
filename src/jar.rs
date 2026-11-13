@@ -6,6 +6,7 @@ use std::path::Path;
 use anyhow::Context;
 use zip::ZipArchive;
 
+use crate::cdir::CentralDirectory;
 use crate::classfile::{ClassHeader, parse_header};
 use crate::manifest::{Manifest, parse_manifest};
 
@@ -117,8 +118,16 @@ impl JarReport {
 pub(crate) fn open(path: &Path) -> anyhow::Result<ZipArchive<BufReader<File>>> {
     let file = File::open(path).with_context(|| format!("cannot open {}", path.display()))?;
     // Unbuffered File means one syscall per small central-directory read; threads then contend in the kernel.
-    ZipArchive::new(BufReader::new(file))
-        .with_context(|| format!("{} is not a valid JAR/ZIP file", path.display()))
+    ZipArchive::new(BufReader::new(file)).with_context(|| invalid_jar(path))
+}
+
+pub(crate) fn invalid_jar(path: &Path) -> String {
+    format!("{} is not a valid JAR/ZIP file", path.display())
+}
+
+pub(crate) fn open_cdir(path: &Path) -> anyhow::Result<CentralDirectory<BufReader<File>>> {
+    let file = File::open(path).with_context(|| format!("cannot open {}", path.display()))?;
+    CentralDirectory::new(BufReader::new(file)).with_context(|| invalid_jar(path))
 }
 
 pub fn read_index(path: &Path) -> anyhow::Result<JarReport> {
