@@ -2,6 +2,8 @@ use std::io::{self, Read, Seek, SeekFrom};
 use std::ops::Range;
 
 use anyhow::{Context, anyhow, bail};
+use flate2::Crc;
+use flate2::read::DeflateDecoder;
 
 const EOCD_SIG: [u8; 4] = *b"PK\x05\x06";
 const EOCD_LEN: usize = 22;
@@ -11,6 +13,13 @@ const ZIP64_EOCD_SIG: [u8; 4] = *b"PK\x06\x06";
 const ZIP64_EOCD_LEN: usize = 56;
 const CENTRAL_SIG: [u8; 4] = *b"PK\x01\x02";
 const CENTRAL_LEN: usize = 46;
+const LOCAL_SIG: [u8; 4] = *b"PK\x03\x04";
+const LOCAL_LEN: usize = 30;
+const METHOD_STORED: u16 = 0;
+const METHOD_DEFLATED: u16 = 8;
+const FLAG_ENCRYPTED: u16 = 1;
+// Initial reservation for `out`; the declared size is untrusted, so the buffer grows with real data.
+const RESERVE_LIMIT: u64 = 64 * 1024;
 
 const ZIP64_EXTRA: u16 = 0x0001;
 const UNICODE_PATH_EXTRA: u16 = 0x7075;
@@ -40,6 +49,87 @@ impl Entry<'_> {
     pub fn is_dir(&self) -> bool {
         self.name.ends_with('/')
     }
+
+    pub fn to_info(&self) -> EntryInfo {
+        EntryInfo {
+            name: self.name.to_string(),
+            size: self.size,
+            compressed_size: self.compressed_size,
+            method: self.method,
+            flags: self.flags,
+            crc32: self.crc32,
+            header_offset: self.header_offset,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EntryInfo {
+    pub name: String,
+    pub size: u64,
+    pub compressed_size: u64,
+    pub method: u16,
+    pub flags: u16,
+    pub crc32: u32,
+    pub header_offset: u64,
+}
+
+pub fn read_entry<R: Read + Seek>(
+    reader: &mut R,
+    entry: &EntryInfo,
+    cap: u64,
+    out: &mut Vec<u8>,
+) -> anyhow::Result<()> {
+    if entry.flags & FLAG_ENCRYPTED != 0 {
+        bail!("encrypted entry");
+    }
+    if !matches!(entry.method, METHOD_STORED | METHOD_DEFLATED) {
+        bail!("unsupported compression method {}", entry.method);
+    }
+
+    let mut h = [0u8; LOCAL_LEN];
+    reader.seek(SeekFrom::Start(entry.header_offset))?;
+    reader.read_exact(&mut h).map_err(|e| match e.kind() {
+        io::ErrorKind::UnexpectedEof => anyhow!("local header is truncated"),
+        _ => e.into(),
+    })?;
+    if h[..4] != LOCAL_SIG {
+        bail!("invalid local header signature");
+    }
+    // The local lengths can differ from the central ones, so only they locate the data.
+    let data_start = entry
+        .header_offset
+        .checked_add(LOCAL_LEN as u64 + u64::from(le16(&h, 26)) + u64::from(le16(&h, 28)))
+        .context("local header offset is too large")?;
+    reader.seek(SeekFrom::Start(data_start))?;
+
+    let start = out.len();
+    out.reserve(entry.size.min(cap).min(RESERVE_LIMIT) as usize);
+    let data = reader.take(entry.compressed_size);
+    let limit = cap.saturating_add(1);
+    let read = if entry.method == METHOD_STORED {
+        data.take(limit).read_to_end(out)
+    } else {
+        DeflateDecoder::new(data).take(limit).read_to_end(out)
+    }
+    .map_err(|e| anyhow!(e))? as u64;
+
+    // Past the cap the caller discards the data, so the checks would only reject a prefix.
+    if read > cap {
+        return Ok(());
+    }
+    if read != entry.size {
+        bail!(
+            "size is {read} bytes, central directory says {}",
+            entry.size
+        );
+    }
+    let mut crc = Crc::new();
+    crc.update(&out[start..]);
+    if crc.sum() != entry.crc32 {
+        bail!("CRC-32 mismatch");
+    }
+    Ok(())
 }
 
 pub struct CentralDirectory<R> {
@@ -377,7 +467,12 @@ fn apply_extras(record: &mut Record, extra: &[u8], raw_name: &[u8]) -> anyhow::R
             }
             UNICODE_PATH_EXTRA => {
                 if let Some((crc, content)) = data.get(1..).and_then(<[u8]>::split_first_chunk)
-                    && u32::from_le_bytes(*crc) == *name_crc.get_or_insert_with(|| crc32(raw_name))
+                    && u32::from_le_bytes(*crc)
+                        == *name_crc.get_or_insert_with(|| {
+                            let mut crc = Crc::new();
+                            crc.update(raw_name);
+                            crc.sum()
+                        })
                     && std::str::from_utf8(content).is_ok()
                 {
                     record.unicode_name = Some(data_start + 5..data_start + len);
@@ -430,17 +525,6 @@ const CP437_HIGH: [char; 128] = [
     'α', 'ß', 'Γ', 'π', 'Σ', 'σ', 'µ', 'τ', 'Φ', 'Θ', 'Ω', 'δ', '∞', 'φ', 'ε', '∩',
     '≡', '±', '≥', '≤', '⌠', '⌡', '÷', '≈', '°', '∙', '·', '√', 'ⁿ', '²', '■', '\u{a0}',
 ];
-
-fn crc32(bytes: &[u8]) -> u32 {
-    let mut crc = !0u32;
-    for &b in bytes {
-        crc ^= u32::from(b);
-        for _ in 0..8 {
-            crc = (crc >> 1) ^ (0xEDB8_8320 & (crc & 1).wrapping_neg());
-        }
-    }
-    !crc
-}
 
 fn le16<const N: usize>(b: &[u8; N], at: usize) -> u16 {
     u16::from_le_bytes([b[at], b[at + 1]])
@@ -496,12 +580,6 @@ mod tests {
         assert_eq!(le32(&b, 1), 0x0504_0302);
         assert_eq!(le64(&b, 2), 0x0A09_0807_0605_0403);
         assert_eq!(le32(&[0xFF; 4], 0), ZIP64_MARK);
-    }
-
-    #[test]
-    fn crc32_check_value() {
-        assert_eq!(crc32(b""), 0);
-        assert_eq!(crc32(b"123456789"), 0xCBF4_3926);
     }
 
     #[test]

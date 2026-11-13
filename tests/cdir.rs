@@ -3,7 +3,7 @@ mod common;
 use std::io::{BufReader, Cursor, Write};
 
 use common::{RawEntry, RawZip, ZIP64_MARK, extra_field, raw_zip, unicode_path_extra};
-use jarscope::cdir::{CentralDirectory, Entry};
+use jarscope::cdir::{CentralDirectory, Entry, EntryInfo, read_entry};
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
@@ -740,4 +740,224 @@ fn garbage_inputs_are_errors() {
             bytes.len()
         );
     }
+}
+
+fn infos(bytes: &[u8]) -> Vec<EntryInfo> {
+    let mut cd = CentralDirectory::new(Cursor::new(bytes)).expect("open");
+    let mut out = Vec::new();
+    while let Some(e) = cd.next_entry().expect("entry") {
+        out.push(e.to_info());
+    }
+    out
+}
+
+fn read_with(bytes: &[u8], info: &EntryInfo, cap: u64) -> anyhow::Result<Vec<u8>> {
+    let mut out = Vec::new();
+    read_entry(&mut Cursor::new(bytes), info, cap, &mut out)?;
+    Ok(out)
+}
+
+fn read_entry_err(bytes: &[u8], info: &EntryInfo) -> String {
+    format!(
+        "{:#}",
+        read_with(bytes, info, u64::MAX / 2).expect_err("must fail")
+    )
+}
+
+fn deflated(entries: &[(&str, &[u8])], stream: bool) -> Vec<u8> {
+    let opts = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+    let mut buf = Vec::new();
+    if stream {
+        let mut zip = ZipWriter::new_stream(&mut buf);
+        for (name, data) in entries {
+            zip.start_file(*name, opts).expect("file");
+            zip.write_all(data).expect("write");
+        }
+        zip.finish().expect("finish");
+    } else {
+        let mut zip = ZipWriter::new(Cursor::new(&mut buf));
+        for (name, data) in entries {
+            zip.start_file(*name, opts).expect("file");
+            zip.write_all(data).expect("write");
+        }
+        zip.finish().expect("finish");
+    }
+    buf
+}
+
+#[test]
+fn reads_stored_and_deflated_entries() {
+    let text = b"Manifest-Version: 1.0\r\n\r\n".repeat(20);
+    let bytes = zipwriter_jar();
+    let mut zip = ZipArchive::new(Cursor::new(&bytes)).expect("zip");
+    for info in infos(&bytes) {
+        let mut want = Vec::new();
+        std::io::Read::read_to_end(&mut zip.by_name(&info.name).expect("by_name"), &mut want)
+            .expect("read");
+        assert_eq!(
+            read_with(&bytes, &info, 1 << 20).expect("read"),
+            want,
+            "{}",
+            info.name
+        );
+    }
+    let bytes = deflated(&[("a.txt", &text)], false);
+    assert_eq!(
+        read_with(&bytes, &infos(&bytes)[0], 1 << 20).expect("read"),
+        text
+    );
+}
+
+#[test]
+fn reads_data_descriptor_entries() {
+    let data = vec![7u8; 300];
+    let bytes = deflated(&[("a/A.class", &data), ("b.txt", b"hello")], true);
+    let infos = infos(&bytes);
+    assert!(infos.iter().all(|i| i.flags & 8 != 0));
+    assert_eq!(read_with(&bytes, &infos[0], 1000).expect("read"), data);
+    assert_eq!(read_with(&bytes, &infos[1], 1000).expect("read"), b"hello");
+}
+
+#[test]
+fn local_lengths_may_differ_from_central() {
+    let mut entry = RawEntry::new("a.txt", b"payload");
+    entry.local_name = Some(b"a-much-longer-local-name.txt".to_vec());
+    entry.local_extra = vec![0xAA; 11];
+    let bytes = raw_zip(&[entry], &RawZip::default());
+    assert_eq!(
+        read_with(&bytes, &infos(&bytes)[0], 100).expect("read"),
+        b"payload"
+    );
+}
+
+#[test]
+fn prepended_data_shifts_the_offset() {
+    let opts = RawZip {
+        prefix: script(),
+        ..RawZip::default()
+    };
+    let bytes = raw_zip(
+        &[RawEntry::new("a", b"one"), RawEntry::new("b", b"two")],
+        &opts,
+    );
+    let infos = infos(&bytes);
+    assert_eq!(read_with(&bytes, &infos[0], 100).expect("read"), b"one");
+    assert_eq!(read_with(&bytes, &infos[1], 100).expect("read"), b"two");
+}
+
+#[test]
+fn cap_boundaries() {
+    let data = vec![b'x'; 100];
+    for bytes in [
+        raw_zip(&[RawEntry::new("a", &data)], &RawZip::default()),
+        deflated(&[("a", &data)], false),
+    ] {
+        let info = &infos(&bytes)[0];
+        assert_eq!(read_with(&bytes, info, 100).expect("at cap"), data);
+        assert_eq!(read_with(&bytes, info, 99).expect("over cap").len(), 100);
+        assert_eq!(read_with(&bytes, info, 10).expect("far over").len(), 11);
+        assert_eq!(read_with(&bytes, info, 0).expect("zero").len(), 1);
+    }
+}
+
+#[test]
+fn zip_bomb_stops_at_cap_plus_one() {
+    let zeros = vec![0u8; 10 << 20];
+    let bytes = deflated(&[("bomb", &zeros)], false);
+    let info = &infos(&bytes)[0];
+    assert!(info.compressed_size < 100_000);
+    let cap = 1 << 20;
+    assert_eq!(
+        read_with(&bytes, info, cap).expect("read").len() as u64,
+        cap + 1
+    );
+}
+
+#[test]
+fn appends_to_existing_output() {
+    let bytes = raw_zip(&[RawEntry::new("a", b"data")], &RawZip::default());
+    let mut out = b"keep".to_vec();
+    read_entry(&mut Cursor::new(&bytes), &infos(&bytes)[0], 100, &mut out).expect("read");
+    assert_eq!(out, b"keepdata");
+}
+
+#[test]
+fn bad_local_signature_is_an_error() {
+    let mut bytes = raw_zip(&[RawEntry::new("a", b"data")], &RawZip::default());
+    assert_eq!(common::break_local_header_bytes(&mut bytes), 1);
+    let err = read_entry_err(&bytes, &infos(&bytes)[0]);
+    assert!(err.contains("invalid local header signature"), "{err}");
+}
+
+#[test]
+fn local_header_past_the_end_is_an_error() {
+    let bytes = raw_zip(&[RawEntry::new("a", b"data")], &RawZip::default());
+    let mut info = infos(&bytes)[0].clone();
+    info.header_offset = bytes.len() as u64 - 5;
+    assert!(read_entry_err(&bytes, &info).contains("truncated"));
+    info.header_offset = u64::MAX - 3;
+    read_entry_err(&bytes, &info);
+}
+
+#[test]
+fn wrong_crc_is_an_error() {
+    let bytes = raw_zip(&[RawEntry::new("a", b"data")], &RawZip::default());
+    let mut info = infos(&bytes)[0].clone();
+    info.crc32 ^= 1;
+    assert!(read_entry_err(&bytes, &info).contains("CRC-32 mismatch"));
+    let bytes = deflated(&[("a", b"data")], false);
+    let mut info = infos(&bytes)[0].clone();
+    info.crc32 ^= 1;
+    assert!(read_entry_err(&bytes, &info).contains("CRC-32 mismatch"));
+}
+
+#[test]
+fn size_mismatch_is_an_error() {
+    let bytes = deflated(&[("a", b"0123456789")], false);
+    let good = infos(&bytes)[0].clone();
+    for size in [5, 20] {
+        let info = EntryInfo {
+            size,
+            ..good.clone()
+        };
+        let err = read_entry_err(&bytes, &info);
+        assert!(err.contains("central directory says"), "{err}");
+    }
+    let bytes = raw_zip(&[RawEntry::new("a", b"0123456789")], &RawZip::default());
+    let good = infos(&bytes)[0].clone();
+    for compressed_size in [5, 1000] {
+        let info = EntryInfo {
+            compressed_size,
+            ..good.clone()
+        };
+        read_entry_err(&bytes, &info);
+    }
+}
+
+#[test]
+fn truncated_deflate_stream_is_an_error() {
+    let data: Vec<u8> = (0..5000u32).map(|i| (i * 7 % 251) as u8).collect();
+    let bytes = deflated(&[("a", &data)], false);
+    let good = infos(&bytes)[0].clone();
+    let info = EntryInfo {
+        compressed_size: good.compressed_size / 2,
+        ..good
+    };
+    read_entry_err(&bytes, &info);
+}
+
+#[test]
+fn encrypted_entry_is_an_error() {
+    let bytes = raw_zip(&[RawEntry::new("a", b"data")], &RawZip::default());
+    let mut info = infos(&bytes)[0].clone();
+    info.flags |= 1;
+    assert!(read_entry_err(&bytes, &info).contains("encrypted entry"));
+}
+
+#[test]
+fn unsupported_method_is_an_error() {
+    let bytes = raw_zip(&[RawEntry::new("a", b"data")], &RawZip::default());
+    let mut info = infos(&bytes)[0].clone();
+    info.method = 12;
+    assert!(read_entry_err(&bytes, &info).contains("unsupported compression method 12"));
 }
