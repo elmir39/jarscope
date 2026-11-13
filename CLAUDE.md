@@ -12,3 +12,4 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - `find`/`list`/`info` read via `cdir`, which yields every record like `jar tf`/`unzip`. Only `version` uses `zip`, which collapses duplicate names (`has_duplicate_names`) and warns.
 - `find` never reads the manifest: `META-INF/versions/N/` classes match regardless of `Multi-Release`.
 - `PathBuf` ordering is component-wise; sort paths bytewise with `as_encoded_bytes()` to match `LC_ALL=C sort`.
+- macOS malloc serves blocks of ≤ 256 bytes per thread and size class; in folder scans avoid new small per-JAR allocations (see `cdir::SCRATCH_CAPACITY`).

@@ -170,7 +170,8 @@ $ jarscope find --nested com.llamalad7.mixinextras.MixinExtrasBootstrap ~/Librar
 | 1 | No match |
 | 2 | Error: empty query, path missing or unreadable, or a single file that isn't a JAR |
 
-Warnings (for example, a JAR with duplicate entry names) go to stderr. In a folder scan, a
+Warnings (for example, `version` finding duplicate entry names) go to stderr. `list` and
+`info` show every entry, duplicates included, like `unzip`. In a folder scan, a
 bad JAR is warned about and skipped, and the scan continues.
 
 ## Performance
@@ -181,32 +182,45 @@ Guava 33.5.0 (1,961 classes):
 | Command | Time | Peak memory |
 |---|---|---|
 | `jarscope version guava.jar` (all classes) | 9.4 ms | 2.3 MiB |
-| `jarscope list guava.jar` | 1.7 ms | 2.6 MiB |
-| `jarscope info guava.jar` | 2.0 ms | 2.6 MiB |
+| `jarscope list guava.jar` | 1.5 ms | 2.0 MiB |
+| `jarscope info guava.jar` | 1.4 ms | 2.1 MiB |
 | `jarscope find <exact name> guava.jar` | 1.7 ms | 3.2 MiB |
-| `unzip -Z1 guava.jar` (list) | 3.1 ms | 2.3 MiB |
-| `unzip -v guava.jar` (info) | 4.9 ms | 2.4 MiB |
+| `unzip -Z1 guava.jar` (list) | 3.2 ms | 2.3 MiB |
+| `unzip -v guava.jar` (info) | 4.9 ms | 2.3 MiB |
 | `jar tf guava.jar` | 45.3 ms | 42.1 MiB |
 | `javap -v` on one class | 144 ms | 73 MiB |
 | `javap -v` on all 1,961 classes | 1.5 s | 193 MiB |
+
+On a huge JAR (`gradle-api-9.6.0.jar`, 50,776 entries):
+
+| Command | Time | Peak memory |
+|---|---|---|
+| `jarscope info` | 3.5 ms | 1.8 MiB |
+| `jarscope list` | 23.9 ms | 7.2 MiB |
+| `jarscope find <missing name>` | 4.5 ms | 2.5 MiB |
+| `unzip -Z1` (list) | 53.8 ms | 2.3 MiB |
+| `unzip -v` (info) | 98.3 ms | 2.3 MiB |
+
+`info` and `find` read the central directory one record at a time, so their memory does not
+grow with the JAR. `list` keeps the names it has to sort.
 
 Finding `org.slf4j.Logger` in the 800 JARs of `~/.m2` (7 hits):
 
 | Command | Time |
 |---|---|
-| `jarscope find org.slf4j.Logger ~/.m2` | 24 ms ± 1 ms |
-| `jarscope find --nested org.slf4j.Logger ~/.m2` | 24 ms ± 1 ms |
+| `jarscope find org.slf4j.Logger ~/.m2` | 20 ms |
+| `jarscope find --nested org.slf4j.Logger ~/.m2` | 20 ms |
 | loop of `unzip -Z1` per JAR | 3.4 s (0.84 s with 10 in parallel) |
 | loop of `jar tf` per JAR | 33 s |
 
-On `~/.gradle` (1,626 JARs among 35k files) `find` takes about 0.26 s; about 0.22 s of that is walking the folder.
+On `~/.gradle` (1,626 JARs among 57k files) `find` takes about 0.24 s and 5 MiB; most of that is walking the folder.
 
-jarscope is faster than `unzip` on time everywhere except tiny-JAR startup (+0.2 ms). Memory is equal on normal JARs, but `unzip` streams the central directory and uses far less on huge JARs (2.4 MiB vs about 20 MiB for 50k entries).
+jarscope is faster than `unzip` and uses about the same memory on normal JARs. On huge JARs `info` uses less than `unzip` and `find` about the same; `list` uses more (7.2 vs 2.3 MiB for 50k entries) because it sorts the names.
 
 Checking 800 JARs, one process per JAR: `jarscope version` takes 1.7 s; `jar tf` (which
 only lists entries) takes 30 s.
 
-The release binary is about 1.0 MiB.
+The release binary is about 1.0 MiB (1,065,600 bytes).
 
 ## Roadmap
 
