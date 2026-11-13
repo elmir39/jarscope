@@ -3,8 +3,8 @@ mod common;
 use std::path::{Path, PathBuf};
 
 use common::{
-    RawEntry, RawZip, break_local_header_bytes, break_local_headers, class_bytes, jar_bytes,
-    make_jar, make_jar_with_duplicate, make_jar_with_manifest, manifest_bytes, raw_zip,
+    RawEntry, RawZip, break_local_header_bytes, break_local_headers, class_bytes, cut_jar_bytes,
+    jar_bytes, make_jar, make_jar_with_duplicate, make_jar_with_manifest, manifest_bytes, raw_zip,
     stored_jar_bytes,
 };
 use jarscope::find::{
@@ -641,23 +641,11 @@ fn zip64_jar_is_found_at_top_level_and_nested() {
     assert!(s.warnings.is_empty(), "{:?}", s.warnings);
 }
 
-// The first record (`a/B.class`) parses; the second one's signature is broken.
-fn cut_jar() -> Vec<u8> {
-    let mut bytes = stored_jar_bytes(&[("a/B.class", class()), ("z/Z.class", class())]);
-    let sig = b"PK\x01\x02";
-    let at: Vec<_> = (0..=bytes.len() - sig.len())
-        .filter(|&i| &bytes[i..i + sig.len()] == sig)
-        .collect();
-    assert_eq!(at.len(), 2);
-    bytes[at[1] + 2] = 0;
-    bytes
-}
-
 #[test]
 fn central_directory_cut_in_the_middle_skips_the_jar() {
     let dir = TempDir::new().expect("tempdir");
     let good = jar(dir.path(), "good.jar", "a/B.class");
-    let bad = write(dir.path(), "bad.jar", cut_jar());
+    let bad = write(dir.path(), "bad.jar", cut_jar_bytes());
     let msg = search_err(&bad);
     assert_eq!(
         msg,
@@ -684,7 +672,7 @@ fn nested_central_directory_cut_in_the_middle_is_a_warning() {
         "outer.jar",
         &[
             ("a/Outer.class", class()),
-            ("META-INF/jars/cut.jar", cut_jar()),
+            ("META-INF/jars/cut.jar", cut_jar_bytes()),
         ],
     );
     let s = search(&jar, "**", true);

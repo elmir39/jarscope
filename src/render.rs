@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use crate::classfile::java_version;
 use crate::find::{FindReport, Location, Query};
-use crate::jar::JarReport;
+use crate::jar::{EntryNames, JarInfo, JarReport};
 use crate::names::{class_name, sort_classes, sort_for_list};
 
 const MAX_LISTED: usize = 10;
@@ -135,14 +135,10 @@ pub fn render_version(report: &JarReport) -> String {
     sections.join("\n")
 }
 
-pub fn render_list(report: &JarReport, classes_only: bool) -> String {
+pub fn render_list(names: &EntryNames, classes_only: bool) -> String {
     let mut out = String::new();
     if classes_only {
-        let mut classes: Vec<_> = report
-            .entries
-            .iter()
-            .filter_map(|e| class_name(&e.name))
-            .collect();
+        let mut classes: Vec<_> = names.iter().filter_map(class_name).collect();
         sort_classes(&mut classes);
         for c in &classes {
             out.push_str(&c.name);
@@ -152,8 +148,9 @@ pub fn render_list(report: &JarReport, classes_only: bool) -> String {
             out.push('\n');
         }
     } else {
-        let mut names: Vec<&str> = report.entries.iter().map(|e| e.name.as_str()).collect();
+        let mut names: Vec<&str> = names.iter().collect();
         sort_for_list(&mut names);
+        out.reserve(names.iter().map(|n| n.len() + 1).sum());
         for n in names {
             out.push_str(n);
             out.push('\n');
@@ -201,9 +198,9 @@ fn size_line(n: u64) -> String {
     }
 }
 
-pub fn render_info(report: &JarReport) -> String {
+pub fn render_info(info: &JarInfo) -> String {
     let mut rows: Vec<(&str, String)> = Vec::new();
-    match &report.manifest {
+    match &info.manifest {
         None => rows.push(("Manifest", "none".to_string())),
         Some(m) => {
             for name in ["Main-Class", "Created-By", "Build-Jdk", "Build-Jdk-Spec"] {
@@ -211,24 +208,27 @@ pub fn render_info(report: &JarReport) -> String {
                     rows.push((name, v.to_string()));
                 }
             }
-            rows.push(("Multi-Release", report.multi_release.to_string()));
+            rows.push(("Multi-Release", info.multi_release.to_string()));
             if let Some(v) = m.get("Automatic-Module-Name") {
                 rows.push(("Automatic-Module-Name", v.to_string()));
             }
         }
     }
-    let classes = report.class_count();
-    let noun = if classes == 1 { "class" } else { "classes" };
+    let noun = if info.classes == 1 {
+        "class"
+    } else {
+        "classes"
+    };
     rows.push((
         "Entries",
         format!(
             "{} ({} {noun})",
-            thousands(report.entries.len() as u64),
-            thousands(classes as u64)
+            thousands(info.entries),
+            thousands(info.classes)
         ),
     ));
-    rows.push(("Compressed", size_line(report.total_compressed_size())));
-    rows.push(("Uncompressed", size_line(report.total_size())));
+    rows.push(("Compressed", size_line(info.compressed_size)));
+    rows.push(("Uncompressed", size_line(info.size)));
 
     let width = rows.iter().map(|(l, _)| l.len()).max().unwrap_or(0) + 3;
     let mut out = String::new();
@@ -401,20 +401,12 @@ Invalid class files: 1
         ));
     }
 
-    fn entries(names: &[&str]) -> JarReport {
-        JarReport {
-            entries: names
-                .iter()
-                .enumerate()
-                .map(|(index, n)| crate::jar::Entry {
-                    index,
-                    name: n.to_string(),
-                    size: 0,
-                    compressed_size: 0,
-                })
-                .collect(),
-            ..JarReport::default()
+    fn entries(names: &[&str]) -> EntryNames {
+        let mut out = EntryNames::default();
+        for n in names {
+            out.push(n);
         }
+        out
     }
 
     #[test]
@@ -448,7 +440,7 @@ Invalid class files: 1
 
     #[test]
     fn list_empty() {
-        let r = JarReport::default();
+        let r = EntryNames::default();
         assert_eq!(render_list(&r, false), "");
         assert_eq!(render_list(&r, true), "");
     }
@@ -474,16 +466,16 @@ Invalid class files: 1
         assert_eq!(human_size(u64::MAX), "18.4 EB");
     }
 
-    fn with_manifest(attrs: &[(&str, &str)]) -> JarReport {
+    fn with_manifest(attrs: &[(&str, &str)]) -> JarInfo {
         let mut text = String::from("Manifest-Version: 1.0\r\n");
         for (k, v) in attrs {
             text.push_str(&format!("{k}: {v}\r\n"));
         }
         let m = crate::manifest::parse_manifest(text.as_bytes());
-        JarReport {
+        JarInfo {
             multi_release: m.is_multi_release(),
             manifest: Some(m),
-            ..JarReport::default()
+            ..JarInfo::default()
         }
     }
 
@@ -496,20 +488,10 @@ Invalid class files: 1
             ("Main-Class", "com.example.Main"),
             ("Build-Jdk", "21.0.5"),
         ]);
-        r.entries = vec![
-            crate::jar::Entry {
-                index: 0,
-                name: "A.class".into(),
-                size: 2_000,
-                compressed_size: 1_000,
-            },
-            crate::jar::Entry {
-                index: 1,
-                name: "B.txt".into(),
-                size: 5,
-                compressed_size: 1,
-            },
-        ];
+        r.entries = 2;
+        r.classes = 1;
+        r.size = 2_005;
+        r.compressed_size = 1_001;
         assert_eq!(
             render_info(&r),
             "\
@@ -529,7 +511,7 @@ Uncompressed:           2.0 KB (2,005 bytes)
     #[test]
     fn info_no_manifest() {
         assert_eq!(
-            render_info(&JarReport::default()),
+            render_info(&JarInfo::default()),
             "Manifest:      none\nEntries:       0 (0 classes)\nCompressed:    0 bytes\nUncompressed:  0 bytes\n"
         );
     }

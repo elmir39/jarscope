@@ -118,6 +118,19 @@ pub fn make_jar_with_duplicate(dir: &Path, name: &str, first: Vec<u8>, second: V
     path
 }
 
+// The first record (`a/B.class`) parses; the second one's signature is broken.
+pub fn cut_jar_bytes() -> Vec<u8> {
+    let class = class_bytes(0, 52);
+    let mut bytes = stored_jar_bytes(&[("a/B.class", class.clone()), ("z/Z.class", class)]);
+    let sig = b"PK\x01\x02";
+    let at: Vec<_> = (0..=bytes.len() - sig.len())
+        .filter(|&i| &bytes[i..i + sig.len()] == sig)
+        .collect();
+    assert_eq!(at.len(), 2);
+    bytes[at[1] + 2] = 0;
+    bytes
+}
+
 pub const ZIP64_MARK: u32 = 0xFFFF_FFFF;
 
 // One stored entry for `raw_zip`. `zip64` writes 0xFFFFFFFF sizes and offset in the central

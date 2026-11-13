@@ -6,7 +6,7 @@ use std::path::Path;
 use anyhow::Context;
 use zip::ZipArchive;
 
-use crate::cdir::CentralDirectory;
+use crate::cdir::{CentralDirectory, EntryInfo, read_entry};
 use crate::classfile::{ClassHeader, parse_header};
 use crate::manifest::{Manifest, parse_manifest};
 
@@ -93,25 +93,46 @@ impl JarReport {
     pub fn required_major(&self) -> Option<u16> {
         self.base.keys().next_back().copied()
     }
+}
 
-    pub fn class_count(&self) -> usize {
-        self.entries
-            .iter()
-            .filter(|e| !e.is_dir() && e.name.ends_with(".class"))
-            .count()
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct JarInfo {
+    pub manifest: Option<Manifest>,
+    pub multi_release: bool,
+    pub entries: u64,
+    pub classes: u64,
+    pub size: u64,
+    pub compressed_size: u64,
+}
+
+// One arena instead of a `String` per name: ~70 bytes per entry on huge JARs.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EntryNames {
+    text: String,
+    ends: Vec<usize>,
+}
+
+impl EntryNames {
+    pub fn push(&mut self, name: &str) {
+        self.text.push_str(name);
+        self.ends.push(self.text.len());
     }
 
-    // Sizes come from untrusted headers; a plain `+` panics on overflow in debug builds.
-    pub fn total_size(&self) -> u64 {
-        self.entries
-            .iter()
-            .fold(0, |sum, e| sum.saturating_add(e.size))
+    pub fn iter(&self) -> impl Iterator<Item = &str> {
+        let mut start = 0;
+        self.ends.iter().map(move |&end| {
+            let name = &self.text[start..end];
+            start = end;
+            name
+        })
     }
 
-    pub fn total_compressed_size(&self) -> u64 {
-        self.entries
-            .iter()
-            .fold(0, |sum, e| sum.saturating_add(e.compressed_size))
+    pub fn len(&self) -> usize {
+        self.ends.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.ends.is_empty()
     }
 }
 
@@ -130,9 +151,38 @@ pub(crate) fn open_cdir(path: &Path) -> anyhow::Result<CentralDirectory<BufReade
     CentralDirectory::new(BufReader::new(file)).with_context(|| invalid_jar(path))
 }
 
-pub fn read_index(path: &Path) -> anyhow::Result<JarReport> {
-    let mut archive = open(path)?;
-    Ok(index(&mut archive))
+pub fn read_info(path: &Path) -> anyhow::Result<JarInfo> {
+    let mut cd = open_cdir(path)?;
+    let mut info = JarInfo::default();
+    let mut manifest = None;
+    while let Some(entry) = cd.next_entry().with_context(|| invalid_jar(path))? {
+        info.entries += 1;
+        if !entry.is_dir() && entry.name.ends_with(".class") {
+            info.classes += 1;
+        }
+        // Sizes come from untrusted headers; a plain `+` panics on overflow in debug builds.
+        info.size = info.size.saturating_add(entry.size);
+        info.compressed_size = info.compressed_size.saturating_add(entry.compressed_size);
+        // The last record wins for a duplicated name, as in `zip` and the JVM's `ZipFile`.
+        if entry.name == MANIFEST_NAME {
+            manifest = Some(entry.to_info());
+        }
+    }
+    if let Some(entry) = manifest {
+        let m = read_manifest_entry(&mut cd.into_inner(), &entry);
+        info.multi_release = m.is_multi_release();
+        info.manifest = Some(m);
+    }
+    Ok(info)
+}
+
+pub fn read_names(path: &Path) -> anyhow::Result<EntryNames> {
+    let mut cd = open_cdir(path)?;
+    let mut names = EntryNames::default();
+    while let Some(entry) = cd.next_entry().with_context(|| invalid_jar(path))? {
+        names.push(entry.name);
+    }
+    Ok(names)
 }
 
 pub fn scan_jar(path: &Path) -> anyhow::Result<JarReport> {
@@ -182,7 +232,6 @@ pub fn scan_jar(path: &Path) -> anyhow::Result<JarReport> {
     Ok(report)
 }
 
-// Opens no entry but the manifest: `list` and `info` must read only the central directory.
 fn index<R: Read + Seek>(archive: &mut ZipArchive<R>) -> JarReport {
     let manifest = read_manifest(archive);
     let mut report = JarReport {
@@ -218,6 +267,17 @@ fn read_manifest<R: Read + Seek>(archive: &mut ZipArchive<R>) -> Option<Manifest
     match entry.take(MANIFEST_LIMIT).read_to_end(&mut bytes) {
         Ok(_) => Some(parse_manifest(&bytes)),
         Err(_) => Some(Manifest::default()),
+    }
+}
+
+fn read_manifest_entry<R: Read + Seek>(reader: &mut R, entry: &EntryInfo) -> Manifest {
+    let mut bytes = Vec::new();
+    match read_entry(reader, entry, MANIFEST_LIMIT, &mut bytes) {
+        Ok(()) => {
+            bytes.truncate(MANIFEST_LIMIT as usize);
+            parse_manifest(&bytes)
+        }
+        Err(_) => Manifest::default(),
     }
 }
 
@@ -305,22 +365,6 @@ mod tests {
             c("META-INF/versions/abc/module-info.class"),
             EntryKind::Other
         );
-    }
-
-    #[test]
-    fn totals_saturate() {
-        let entry = |index| Entry {
-            index,
-            name: format!("e{index}"),
-            size: u64::MAX,
-            compressed_size: u64::MAX - 1,
-        };
-        let r = JarReport {
-            entries: vec![entry(0), entry(1)],
-            ..JarReport::default()
-        };
-        assert_eq!(r.total_size(), u64::MAX);
-        assert_eq!(r.total_compressed_size(), u64::MAX);
     }
 
     #[test]

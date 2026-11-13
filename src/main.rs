@@ -5,8 +5,7 @@ use std::time::Instant;
 
 use clap::{Parser, Subcommand};
 use jarscope::find::{Query, find};
-use jarscope::jar::JarReport;
-use jarscope::jar::{read_index, scan_jar};
+use jarscope::jar::{read_info, read_names, scan_jar};
 use jarscope::render::{
     render_find, render_find_summary, render_info, render_list, render_version,
 };
@@ -75,37 +74,27 @@ fn fail(err: &anyhow::Error) -> ExitCode {
     ExitCode::from(2)
 }
 
-fn warn(report: &JarReport, jar: &std::path::Path, duplicate_note: &str) {
-    if report.duplicate_names {
-        stderr_line(&format!(
-            "warning: {} has duplicate entry names; {duplicate_note}",
-            jar.display()
-        ));
-    }
-    for (name, reason) in &report.invalid {
-        stderr_line(&format!("warning: {name}: {reason}"));
-    }
-}
-
 fn main() -> ExitCode {
     let cli = Cli::parse();
     match cli.command {
         Command::Version { jar } => match scan_jar(&jar) {
-            Ok(report) => write_stdout(&render_version(&report), ExitCode::SUCCESS),
-            Err(err) => fail(&err),
-        },
-        Command::List { jar, classes_only } => match read_index(&jar) {
             Ok(report) => {
-                warn(&report, &jar, "each name is listed once");
-                write_stdout(&render_list(&report, classes_only), ExitCode::SUCCESS)
+                if report.duplicate_names {
+                    stderr_line(&format!(
+                        "warning: {} has duplicate entry names; classes are counted once per name",
+                        jar.display()
+                    ));
+                }
+                write_stdout(&render_version(&report), ExitCode::SUCCESS)
             }
             Err(err) => fail(&err),
         },
-        Command::Info { jar } => match read_index(&jar) {
-            Ok(report) => {
-                warn(&report, &jar, "counts and sizes cover one entry per name");
-                write_stdout(&render_info(&report), ExitCode::SUCCESS)
-            }
+        Command::List { jar, classes_only } => match read_names(&jar) {
+            Ok(names) => write_stdout(&render_list(&names, classes_only), ExitCode::SUCCESS),
+            Err(err) => fail(&err),
+        },
+        Command::Info { jar } => match read_info(&jar) {
+            Ok(info) => write_stdout(&render_info(&info), ExitCode::SUCCESS),
             Err(err) => fail(&err),
         },
         Command::Find { class, dir, nested } => {

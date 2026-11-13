@@ -170,18 +170,118 @@ fn list_classes_only() {
 }
 
 #[test]
-fn list_duplicate_names_warns_on_stderr() {
+fn duplicate_names_are_listed_and_counted_but_version_warns() {
     let dir = TempDir::new().expect("tempdir");
     let jar = make_jar_with_duplicate(dir.path(), "d.jar", class_bytes(0, 52), class_bytes(0, 55));
-    let out = jarscope().arg("list").arg(&jar).output().expect("run");
+    let run = |args: &[&str]| jarscope().args(args).arg(&jar).output().expect("run");
+
+    for (args, want) in [
+        (&["list"][..], "a/A.class\na/A.class\n"),
+        (&["list", "--classes-only"][..], "a.A\na.A\n"),
+    ] {
+        let out = run(args);
+        assert_eq!(out.status.code(), Some(0));
+        assert_eq!(String::from_utf8_lossy(&out.stdout), want);
+        assert!(
+            out.stderr.is_empty(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    let out = run(&["info"]);
     assert_eq!(out.status.code(), Some(0));
-    assert_eq!(String::from_utf8_lossy(&out.stdout), "a/A.class\n");
-    let err = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        err.contains("warning: ")
-            && err.contains("has duplicate entry names; each name is listed once"),
-        "{err}"
+    let size = 2 * class_bytes(0, 52).len();
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter(|l| l.starts_with("Entries:") || l.starts_with("Uncompressed:"))
+            .collect::<Vec<_>>(),
+        [
+            "Entries:       2 (2 classes)".to_string(),
+            format!("Uncompressed:  {size} bytes"),
+        ]
     );
+    assert!(
+        out.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let out = run(&["version"]);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        format!(
+            "warning: {} has duplicate entry names; classes are counted once per name\n",
+            jar.display()
+        )
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).starts_with("Requires: Java 11 (major 55)\n"));
+}
+
+#[test]
+fn central_directory_cut_in_the_middle_is_an_error() {
+    let dir = TempDir::new().expect("tempdir");
+    let jar = dir.path().join("cut.jar");
+    std::fs::write(&jar, common::cut_jar_bytes()).expect("write");
+    for args in [&["list"][..], &["list", "--classes-only"], &["info"]] {
+        let out = jarscope().args(args).arg(&jar).output().expect("run");
+        assert_eq!(out.status.code(), Some(2), "{args:?}");
+        assert!(out.stdout.is_empty(), "{args:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stderr),
+            format!(
+                "error: {} is not a valid JAR/ZIP file: truncated or corrupt central directory\n",
+                jar.display()
+            )
+        );
+    }
+}
+
+#[test]
+fn list_and_info_on_prepended_and_zip64_jars() {
+    use common::{RawEntry, RawZip, raw_zip};
+    let dir = TempDir::new().expect("tempdir");
+    let manifest = common::manifest_bytes(&[("Main-Class", "a.Main")]);
+    let class = class_bytes(0, 52);
+    let script = b"#!/bin/sh\nexec java -jar \"$0\" \"$@\"\n".to_vec();
+    for (zip64, prefix) in [(false, script.clone()), (true, Vec::new()), (true, script)] {
+        let entries: Vec<RawEntry> = [
+            ("a/Main.class", class.clone()),
+            ("META-INF/MANIFEST.MF", manifest.clone()),
+            ("a/", Vec::new()),
+        ]
+        .into_iter()
+        .map(|(n, d)| RawEntry {
+            zip64,
+            ..RawEntry::new(n, d)
+        })
+        .collect();
+        let opts = RawZip {
+            zip64,
+            prefix,
+            ..RawZip::default()
+        };
+        let jar = dir.path().join("x.jar");
+        std::fs::write(&jar, raw_zip(&entries, &opts)).expect("write");
+
+        let out = jarscope().arg("list").arg(&jar).output().expect("run");
+        assert_eq!(out.status.code(), Some(0));
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "META-INF/MANIFEST.MF\na/\na/Main.class\n"
+        );
+        let out = jarscope().arg("info").arg(&jar).output().expect("run");
+        assert_eq!(out.status.code(), Some(0));
+        let size = manifest.len() + class.len();
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            format!(
+                "Main-Class:     a.Main\nMulti-Release:  false\nEntries:        3 (1 class)\nCompressed:     {size} bytes\nUncompressed:   {size} bytes\n"
+            )
+        );
+    }
 }
 
 #[test]
