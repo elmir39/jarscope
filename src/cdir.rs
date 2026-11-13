@@ -31,6 +31,10 @@ const FIRST_WINDOW: u64 = 1024;
 // The EOCD is 22 bytes plus a comment of at most 65,535 bytes, so it can't start earlier.
 const MAX_WINDOW: u64 = EOCD_LEN as u64 + u16::MAX as u64;
 
+// macOS serves blocks of up to 256 bytes from pages per CPU and per size; buffers regrown from
+// tiny sizes in every archive on every thread of a folder scan touch ~1 MiB of extra pages.
+pub(crate) const SCRATCH_CAPACITY: usize = 512;
+
 const CORRUPT: &str = "truncated or corrupt central directory";
 const MULTI_DISK: &str = "multi-disk archives are not supported";
 
@@ -235,8 +239,8 @@ impl<R: Read + Seek> CentralDirectory<R> {
             pos,
             end,
             shift,
-            name: Vec::new(),
-            extra: Vec::new(),
+            name: Vec::with_capacity(SCRATCH_CAPACITY),
+            extra: Vec::with_capacity(SCRATCH_CAPACITY),
             decoded: String::new(),
         }
     }

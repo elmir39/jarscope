@@ -7,7 +7,7 @@ use anyhow::{Context, Result, bail};
 use rayon::prelude::*;
 use walkdir::WalkDir;
 
-use crate::cdir::{CentralDirectory, EntryInfo, read_entry};
+use crate::cdir::{CentralDirectory, EntryInfo, SCRATCH_CAPACITY, read_entry};
 use crate::jar::{VERSIONS_PREFIX, invalid_jar, open_cdir, parse_release};
 use crate::render::human_size;
 
@@ -50,7 +50,10 @@ impl Query {
     }
 
     pub fn matches(&self, class_name: &str) -> bool {
-        let name = class_name.as_bytes();
+        self.matches_bytes(class_name.as_bytes())
+    }
+
+    fn matches_bytes(&self, name: &[u8]) -> bool {
         if !self.has_wildcard {
             let pattern = self.pattern.as_bytes();
             return name.len() == pattern.len()
@@ -92,6 +95,14 @@ pub struct ClassLocation {
 }
 
 pub fn class_location(entry: &str) -> Option<ClassLocation> {
+    let (location, path) = class_path(entry)?;
+    Some(ClassLocation {
+        name: path.replace('/', "."),
+        location,
+    })
+}
+
+fn class_path(entry: &str) -> Option<(Location, &str)> {
     let path = entry.strip_suffix(".class")?;
     if path.ends_with('/') {
         return None;
@@ -110,10 +121,7 @@ pub fn class_location(entry: &str) -> Option<ClassLocation> {
     if path.is_empty() {
         return None;
     }
-    Some(ClassLocation {
-        name: path.replace('/', "."),
-        location,
-    })
+    Some((location, path))
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -130,8 +138,8 @@ pub struct JarSearch {
 
 pub fn search_jar(path: &Path, query: &Query, nested: bool) -> Result<JarSearch> {
     let archive = open_cdir(path)?;
-    let display = path.display().to_string();
-    search(archive, &display, query, nested, &Limits::DEFAULT).with_context(|| invalid_jar(path))
+    search(archive, &path.display(), query, nested, &Limits::DEFAULT)
+        .with_context(|| invalid_jar(path))
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -250,7 +258,7 @@ struct Search<'a> {
 
 fn search<R: Read + Seek>(
     archive: CentralDirectory<R>,
-    display: &str,
+    display: &dyn fmt::Display,
     query: &Query,
     nested: bool,
     limits: &Limits,
@@ -284,15 +292,22 @@ impl Search<'_> {
     fn archive<R: Read + Seek>(
         &mut self,
         mut archive: CentralDirectory<R>,
-        display: &str,
+        display: &dyn fmt::Display,
         depth: usize,
     ) -> Result<()> {
         let mut classes = Vec::new();
         let mut candidates = Vec::new();
+        // One buffer per archive instead of a `String` per class (see `SCRATCH_CAPACITY`).
+        let mut dotted = Vec::with_capacity(SCRATCH_CAPACITY);
         while let Some(entry) = archive.next_entry()? {
-            if let Some(class) = class_location(entry.name) {
-                if self.query.matches(&class.name) {
-                    classes.push(class);
+            if let Some((location, path)) = class_path(entry.name) {
+                dotted.clear();
+                dotted.extend(path.bytes().map(|b| if b == b'/' { b'.' } else { b }));
+                if self.query.matches_bytes(&dotted) {
+                    classes.push(ClassLocation {
+                        name: path.replace('/', "."),
+                        location,
+                    });
                 }
             } else if self.nested && is_nested_jar(entry.name) {
                 candidates.push(entry.to_info());
@@ -587,7 +602,7 @@ mod tests {
 
     fn run(outer: Vec<u8>, limits: &Limits) -> (Vec<String>, Vec<String>) {
         let archive = CentralDirectory::new(Cursor::new(outer)).unwrap();
-        let out = search(archive, "o.jar", &q("**.X"), true, limits).unwrap();
+        let out = search(archive, &"o.jar", &q("**.X"), true, limits).unwrap();
         let paths = out.matches.into_iter().map(|m| m.path).collect();
         (paths, out.warnings)
     }
