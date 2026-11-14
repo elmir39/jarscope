@@ -1,9 +1,9 @@
 mod common;
 
-use std::io::{BufReader, Cursor, Write};
+use std::io::{BufRead, BufReader, Cursor, Seek, Write};
 
 use common::{RawEntry, RawZip, ZIP64_MARK, extra_field, raw_zip, unicode_path_extra};
-use jarscope::cdir::{CentralDirectory, Entry, EntryInfo, read_entry};
+use jarscope::cdir::{CentralDirectory, Entry, EntryInfo, EntryReader, read_entry};
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
@@ -974,4 +974,605 @@ fn unsupported_method_is_an_error() {
     let mut info = infos(&bytes)[0].clone();
     info.method = 12;
     assert!(read_entry_err(&bytes, &info).contains("unsupported compression method 12"));
+}
+
+fn entry_of(info: &EntryInfo) -> Entry<'_> {
+    Entry {
+        name: &info.name,
+        size: info.size,
+        compressed_size: info.compressed_size,
+        method: info.method,
+        flags: info.flags,
+        crc32: info.crc32,
+        header_offset: info.header_offset,
+    }
+}
+
+fn entry_reader(bytes: &[u8]) -> EntryReader<BufReader<Cursor<&[u8]>>> {
+    EntryReader::new(BufReader::new(Cursor::new(bytes)))
+}
+
+fn prefix_n<R: BufRead + Seek>(
+    reader: &mut EntryReader<R>,
+    info: &EntryInfo,
+    len: usize,
+) -> anyhow::Result<Vec<u8>> {
+    let mut out = vec![0xEE; len];
+    let n = reader.read_prefix(&entry_of(info), &mut out)?;
+    assert!(n <= len);
+    out.truncate(n);
+    Ok(out)
+}
+
+fn prefix<R: BufRead + Seek>(
+    reader: &mut EntryReader<R>,
+    info: &EntryInfo,
+) -> anyhow::Result<Vec<u8>> {
+    prefix_n(reader, info, 8)
+}
+
+fn prefix_err<R: BufRead + Seek>(reader: &mut EntryReader<R>, info: &EntryInfo) -> String {
+    format!(
+        "{:#}",
+        prefix(reader, info).expect_err("read_prefix must fail")
+    )
+}
+
+fn want_prefix(bytes: &[u8], info: &EntryInfo, len: usize) -> Vec<u8> {
+    let mut data = read_with(bytes, info, u64::MAX / 2).expect("read_entry");
+    data.truncate(len);
+    data
+}
+
+fn xorshift(len: usize, mut state: u64) -> Vec<u8> {
+    (0..len)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 24) as u8
+        })
+        .collect()
+}
+
+fn pattern(len: usize) -> Vec<u8> {
+    (0..len).map(|i| (i * 37 % 251) as u8).collect()
+}
+
+fn class_with(tail: Vec<u8>) -> Vec<u8> {
+    let mut v = common::class_bytes(3, 61)[..8].to_vec();
+    v.extend(tail);
+    v
+}
+
+fn compressible_class() -> Vec<u8> {
+    let mut text = String::new();
+    let mut i = 0u32;
+    while text.len() < 64 * 1024 {
+        text.push_str(&format!(
+            "line {i}: method m{} calls field f{} of class C{}\n",
+            i * 31 % 97,
+            i * 17 % 89,
+            i % 13
+        ));
+        i += 1;
+    }
+    class_with(text.into_bytes())
+}
+
+fn incompressible_class() -> Vec<u8> {
+    class_with(xorshift(64 * 1024, 0x9E37_79B9_7F4A_7C15))
+}
+
+fn zipwriter_bytes(entries: &[(&str, &[u8], CompressionMethod)], stream: bool) -> Vec<u8> {
+    let mut buf = Vec::new();
+    let opts = |method| {
+        let opts = SimpleFileOptions::default().compression_method(method);
+        if method == CompressionMethod::Deflated {
+            opts.compression_level(Some(9))
+        } else {
+            opts
+        }
+    };
+    if stream {
+        let mut zip = ZipWriter::new_stream(&mut buf);
+        for (name, data, method) in entries {
+            zip.start_file(*name, opts(*method)).expect("file");
+            zip.write_all(data).expect("write");
+        }
+        zip.finish().expect("finish");
+    } else {
+        let mut zip = ZipWriter::new(Cursor::new(&mut buf));
+        for (name, data, method) in entries {
+            zip.start_file(*name, opts(*method)).expect("file");
+            zip.write_all(data).expect("write");
+        }
+        zip.finish().expect("finish");
+    }
+    buf
+}
+
+const LENGTHS: [usize; 9] = [0, 1, 7, 8, 9, 12, 100, 1000, 5000];
+
+fn sized_entries() -> Vec<(String, Vec<u8>)> {
+    LENGTHS
+        .iter()
+        .map(|&len| (format!("c/L{len}.class"), pattern(len)))
+        .collect()
+}
+
+fn one_method_jar(method: CompressionMethod, stream: bool) -> Vec<u8> {
+    let entries = sized_entries();
+    let refs: Vec<_> = entries
+        .iter()
+        .map(|(n, d)| (n.as_str(), d.as_slice(), method))
+        .collect();
+    zipwriter_bytes(&refs, stream)
+}
+
+fn varied_jar(stream: bool) -> Vec<u8> {
+    let (compressible, incompressible) = (compressible_class(), incompressible_class());
+    let mut entries: Vec<(String, Vec<u8>, CompressionMethod)> = Vec::new();
+    for (i, (name, data)) in sized_entries().into_iter().enumerate() {
+        entries.push((format!("s/{name}"), data.clone(), CompressionMethod::Stored));
+        let method = if i % 2 == 0 {
+            CompressionMethod::Deflated
+        } else {
+            CompressionMethod::Stored
+        };
+        entries.push((
+            format!("{}-long-name-{}", "d".repeat(40), name),
+            data,
+            method,
+        ));
+        entries.push((
+            format!("z/{name}"),
+            pattern(LENGTHS[i] * 3 + 1),
+            CompressionMethod::Deflated,
+        ));
+    }
+    entries.push((
+        "big/Text.class".into(),
+        compressible,
+        CompressionMethod::Deflated,
+    ));
+    entries.push((
+        "big/Noise.class".into(),
+        incompressible,
+        CompressionMethod::Deflated,
+    ));
+    entries.push((
+        "big/NoiseStored.class".into(),
+        incompressible_class(),
+        CompressionMethod::Stored,
+    ));
+    let refs: Vec<_> = entries
+        .iter()
+        .map(|(n, d, m)| (n.as_str(), d.as_slice(), *m))
+        .collect();
+    zipwriter_bytes(&refs, stream)
+}
+
+fn local_lengths_jar() -> Vec<u8> {
+    let mut first = RawEntry::new("a.class", pattern(20));
+    first.local_name = Some(b"a-much-longer-local-name.class".to_vec());
+    first.local_extra = extra_field(0xCAFE, &[0xAA; 70]);
+    let mut second = RawEntry::new("b-central-name-is-longer.class", pattern(9));
+    second.local_name = Some(b"b".to_vec());
+    let third = RawEntry::new("c.class", pattern(3));
+    raw_zip(&[first, second, third], &RawZip::default())
+}
+
+fn shuffled(n: usize, mut state: u64) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..n).collect();
+    for i in (1..n).rev() {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        order.swap(i, (state % (i as u64 + 1)) as usize);
+    }
+    order
+}
+
+// Every entry's first 8 bytes as `read_entry` sees them.
+fn expected(bytes: &[u8]) -> (Vec<EntryInfo>, Vec<Vec<u8>>) {
+    let infos = infos(bytes);
+    let want = infos.iter().map(|i| want_prefix(bytes, i, 8)).collect();
+    (infos, want)
+}
+
+fn assert_all_orders<R: BufRead + Seek>(
+    reader: &mut EntryReader<R>,
+    (infos, want): &(Vec<EntryInfo>, Vec<Vec<u8>>),
+) {
+    let n = infos.len();
+    let orders = [
+        (0..n).collect(),
+        (0..n).rev().collect(),
+        shuffled(n, 0x2545_F491_4F6C_DD1D),
+    ];
+    for order in orders {
+        for i in order {
+            assert_eq!(
+                prefix(reader, &infos[i]).expect("read_prefix"),
+                want[i],
+                "{}",
+                infos[i].name
+            );
+        }
+    }
+}
+
+#[test]
+fn read_prefix_gives_the_first_bytes_of_stored_and_deflated_entries() {
+    for method in [CompressionMethod::Stored, CompressionMethod::Deflated] {
+        let bytes = one_method_jar(method, false);
+        let infos = infos(&bytes);
+        let mut reader = entry_reader(&bytes);
+        for (info, &len) in infos.iter().zip(&LENGTHS) {
+            let data = pattern(len);
+            let got = prefix(&mut reader, info).expect("read_prefix");
+            assert_eq!(got, data[..len.min(8)], "{method:?} {len}");
+            assert_eq!(got, want_prefix(&bytes, info, 8), "{method:?} {len}");
+        }
+        for len in [0, 1, 64, 8192] {
+            for info in &infos {
+                assert_eq!(
+                    prefix_n(&mut reader, info, len).expect("read_prefix"),
+                    want_prefix(&bytes, info, len),
+                    "{method:?} {} into {len}",
+                    info.name
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn read_prefix_in_archive_reverse_and_shuffled_order() {
+    let bytes = varied_jar(false);
+    assert_all_orders(&mut entry_reader(&bytes), &expected(&bytes));
+}
+
+#[test]
+fn read_prefix_across_buffer_boundaries() {
+    let jars = [varied_jar(false), varied_jar(true), local_lengths_jar()];
+    let expected: Vec<_> = jars.iter().map(|b| expected(b)).collect();
+    for c in (1..=64).chain([8192]) {
+        for (bytes, want) in jars.iter().zip(&expected) {
+            let mut reader = EntryReader::new(BufReader::with_capacity(c, Cursor::new(bytes)));
+            assert_all_orders(&mut reader, want);
+        }
+    }
+}
+
+#[test]
+fn compressible_and_incompressible_classes() {
+    let (text, noise) = (compressible_class(), incompressible_class());
+    let bytes = zipwriter_bytes(
+        &[
+            ("Text.class", &text, CompressionMethod::Deflated),
+            ("Noise.class", &noise, CompressionMethod::Deflated),
+        ],
+        false,
+    );
+    let infos = infos(&bytes);
+    assert!(
+        infos[0].compressed_size * 4 < infos[0].size,
+        "{:?}",
+        infos[0]
+    );
+    assert!(infos[1].compressed_size >= infos[1].size, "{:?}", infos[1]);
+    let mut reader = entry_reader(&bytes);
+    assert_eq!(prefix(&mut reader, &infos[0]).expect("text"), text[..8]);
+    assert_eq!(prefix(&mut reader, &infos[1]).expect("noise"), noise[..8]);
+    assert_eq!(
+        prefix_n(&mut reader, &infos[1], noise.len() + 1).expect("whole noise"),
+        noise
+    );
+}
+
+#[test]
+fn read_prefix_of_data_descriptor_entries() {
+    for method in [CompressionMethod::Stored, CompressionMethod::Deflated] {
+        let bytes = one_method_jar(method, true);
+        let infos = infos(&bytes);
+        assert!(infos.iter().all(|i| i.flags & 8 != 0), "{infos:?}");
+        let mut reader = entry_reader(&bytes);
+        for (info, &len) in infos.iter().zip(&LENGTHS) {
+            assert_eq!(
+                prefix(&mut reader, info).expect("read_prefix"),
+                pattern(len)[..len.min(8)],
+                "{method:?} {len}"
+            );
+        }
+    }
+}
+
+#[test]
+fn read_prefix_uses_the_local_lengths() {
+    let bytes = local_lengths_jar();
+    let infos = infos(&bytes);
+    let mut reader = entry_reader(&bytes);
+    for (info, len) in infos.iter().zip([20, 9, 3]) {
+        assert_eq!(
+            prefix(&mut reader, info).expect("read_prefix"),
+            pattern(len)[..len.min(8)]
+        );
+    }
+}
+
+#[test]
+fn read_prefix_with_prepended_data() {
+    let mut bytes = script();
+    bytes.extend(varied_jar(false));
+    assert!(infos(&bytes)[0].header_offset == 100);
+    assert_all_orders(&mut entry_reader(&bytes), &expected(&bytes));
+
+    let opts = RawZip {
+        prefix: script(),
+        ..zip64_opts()
+    };
+    let bytes = raw_zip(&zip64_raw(), &opts);
+    let infos = infos(&bytes);
+    let mut reader = entry_reader(&bytes);
+    assert_eq!(prefix(&mut reader, &infos[1]).expect("a"), b"aaaa");
+    assert_eq!(prefix(&mut reader, &infos[2]).expect("b"), b"bee");
+}
+
+#[test]
+fn read_prefix_of_zip64_jars() {
+    let bytes = raw_zip(&zip64_raw(), &zip64_opts());
+    let raw = infos(&bytes);
+    let mut reader = entry_reader(&bytes);
+    assert_eq!(prefix(&mut reader, &raw[0]).expect("dir"), b"");
+    assert_eq!(prefix(&mut reader, &raw[1]).expect("a"), b"aaaa");
+    assert_eq!(prefix(&mut reader, &raw[2]).expect("b"), b"bee");
+
+    let mut zip = ZipWriter::new(Cursor::new(Vec::new()));
+    let opts = SimpleFileOptions::default()
+        .compression_method(CompressionMethod::Deflated)
+        .large_file(true);
+    let big = compressible_class();
+    zip.start_file("Big.class", opts).expect("file");
+    zip.write_all(&big).expect("write");
+    zip.start_file("small.txt", opts).expect("file");
+    zip.write_all(b"hi").expect("write");
+    let bytes = zip.finish().expect("finish").into_inner();
+    let first = central_headers(&bytes)[0];
+    assert_eq!(&bytes[first + 20..first + 28], [0xFF; 8]);
+    let large = infos(&bytes);
+    let mut reader = entry_reader(&bytes);
+    assert_eq!(prefix(&mut reader, &large[0]).expect("big"), big[..8]);
+    assert_eq!(prefix(&mut reader, &large[1]).expect("small"), b"hi");
+}
+
+fn data_start(bytes: &[u8], info: &EntryInfo) -> usize {
+    let at = usize::try_from(info.header_offset).expect("offset fits");
+    let len = |i: usize| usize::from(u16::from_le_bytes([bytes[at + i], bytes[at + i + 1]]));
+    at + 30 + len(26) + len(28)
+}
+
+// Reads `good[0]` first so the position is known, then `bad`, then the good entries after it
+// (relative seeks from wherever the failed read left the reader), then all of them: one bad
+// entry must never break the next read.
+fn fails_then_recovers(bytes: &[u8], bad: &EntryInfo, good: &[&EntryInfo]) -> String {
+    let after = good
+        .iter()
+        .filter(|i| i.header_offset > bad.header_offset.min(bytes.len() as u64));
+    let order: Vec<_> = after.chain(good).collect();
+    for c in [8192, 3] {
+        let mut reader = EntryReader::new(BufReader::with_capacity(c, Cursor::new(bytes)));
+        prefix(&mut reader, good[0]).expect("first good read");
+        let err = prefix_err(&mut reader, bad);
+        for info in &order {
+            assert_eq!(
+                prefix(&mut reader, info).expect("read after an error"),
+                want_prefix(bytes, info, 8),
+                "{} after {err}",
+                info.name
+            );
+        }
+        if c == 3 {
+            return err;
+        }
+    }
+    unreachable!()
+}
+
+fn error_jar(method: CompressionMethod) -> Vec<u8> {
+    zipwriter_bytes(
+        &[
+            ("a.class", &pattern(12), method),
+            ("b.class", &pattern(5), method),
+            ("c.class", &pattern(100), method),
+        ],
+        false,
+    )
+}
+
+fn assert_fails(bytes: &[u8], bad: &EntryInfo, expected: &str) {
+    let infos = infos(bytes);
+    let good: Vec<_> = infos.iter().collect();
+    let err = fails_then_recovers(bytes, bad, &good);
+    assert!(
+        err.contains(expected),
+        "{err:?} should contain {expected:?}"
+    );
+}
+
+#[test]
+fn read_prefix_errors_on_unsupported_entries() {
+    let bytes = error_jar(CompressionMethod::Deflated);
+    let b = infos(&bytes)[1].clone();
+    let encrypted = EntryInfo {
+        flags: b.flags | 1,
+        ..b.clone()
+    };
+    assert_fails(&bytes, &encrypted, "encrypted entry");
+    let method = EntryInfo {
+        method: 12,
+        ..b.clone()
+    };
+    assert_fails(&bytes, &method, "unsupported compression method 12");
+}
+
+#[test]
+fn read_prefix_errors_on_a_bad_local_signature() {
+    for method in [CompressionMethod::Stored, CompressionMethod::Deflated] {
+        let mut bytes = error_jar(method);
+        let infos = infos(&bytes);
+        let at = infos[1].header_offset as usize;
+        assert_eq!(common::break_local_header_bytes(&mut bytes[at..at + 4]), 1);
+        let err = fails_then_recovers(&bytes, &infos[1], &[&infos[0], &infos[2]]);
+        assert!(err.contains("invalid local header signature"), "{err}");
+    }
+}
+
+#[test]
+fn read_prefix_errors_on_corrupt_deflate_data() {
+    let mut bytes = error_jar(CompressionMethod::Deflated);
+    let infos = infos(&bytes);
+    let at = data_start(&bytes, &infos[1]);
+    bytes[at] = 0xFF;
+    let err = fails_then_recovers(&bytes, &infos[1], &[&infos[0], &infos[2]]);
+    assert!(err.contains("invalid block type"), "{err}");
+}
+
+#[test]
+fn read_prefix_errors_on_a_deflate_stream_cut_short() {
+    let bytes = error_jar(CompressionMethod::Deflated);
+    let c = infos(&bytes)[2].clone();
+    let cut = EntryInfo {
+        compressed_size: 1,
+        ..c
+    };
+    assert_fails(&bytes, &cut, "deflate data is truncated");
+}
+
+#[test]
+fn read_prefix_checks_the_crc_of_short_entries() {
+    for method in [CompressionMethod::Stored, CompressionMethod::Deflated] {
+        let bytes = error_jar(method);
+        let b = infos(&bytes)[1].clone();
+        let wrong = EntryInfo {
+            crc32: b.crc32 ^ 1,
+            ..b
+        };
+        assert_fails(&bytes, &wrong, "CRC-32 mismatch");
+    }
+}
+
+#[test]
+fn read_prefix_checks_the_size() {
+    let bytes = error_jar(CompressionMethod::Stored);
+    let b = infos(&bytes)[1].clone();
+    let short = EntryInfo {
+        compressed_size: 3,
+        ..b
+    };
+    assert_fails(&bytes, &short, "size is 3 bytes, central directory says 5");
+
+    for method in [CompressionMethod::Stored, CompressionMethod::Deflated] {
+        let bytes = error_jar(method);
+        let a = infos(&bytes)[0].clone();
+        assert_eq!(a.size, 12);
+        let larger = EntryInfo { size: 5, ..a };
+        assert_fails(
+            &bytes,
+            &larger,
+            "data is larger than the 5 bytes the central directory says",
+        );
+    }
+}
+
+#[test]
+fn read_prefix_errors_on_stored_data_past_the_end() {
+    let full = error_jar(CompressionMethod::Stored);
+    let infos = infos(&full);
+    let bytes = &full[..data_start(&full, &infos[2]) + 3];
+    let err = fails_then_recovers(bytes, &infos[2], &[&infos[0], &infos[1]]);
+    assert!(err.contains("entry data is truncated"), "{err}");
+}
+
+#[test]
+fn read_prefix_errors_on_a_local_header_past_the_end() {
+    let bytes = error_jar(CompressionMethod::Deflated);
+    let c = infos(&bytes)[2].clone();
+    let near = EntryInfo {
+        header_offset: bytes.len() as u64 - 5,
+        ..c.clone()
+    };
+    assert_fails(&bytes, &near, "local header is truncated");
+    let past = EntryInfo {
+        header_offset: bytes.len() as u64 + 100,
+        ..c.clone()
+    };
+    assert_fails(&bytes, &past, "local header is truncated");
+    let huge = EntryInfo {
+        header_offset: u64::MAX - 3,
+        ..c
+    };
+    assert_fails(&bytes, &huge, "local header is truncated");
+}
+
+// 0.3.2 read 8 bytes through `zip` and never got to its CRC check for entries of 8 bytes or
+// more, nor to a size check unless more than the declared size came out.
+#[test]
+fn read_prefix_keeps_the_lenient_checks_of_0_3_2() {
+    for method in [CompressionMethod::Stored, CompressionMethod::Deflated] {
+        let bytes = zipwriter_bytes(
+            &[
+                ("Eight.class", &pattern(8), method),
+                ("Twelve.class", &pattern(12), method),
+            ],
+            false,
+        );
+        let infos = infos(&bytes);
+        let mut reader = entry_reader(&bytes);
+        let mut lenient = |info: EntryInfo| {
+            assert!(read_with(&bytes, &info, u64::MAX / 2).is_err(), "{info:?}");
+            assert_eq!(
+                prefix(&mut reader, &info).expect("read_prefix"),
+                pattern(8),
+                "{method:?} {info:?}"
+            );
+        };
+        lenient(EntryInfo {
+            crc32: infos[0].crc32 ^ 1,
+            ..infos[0].clone()
+        });
+        for size in [8, 100] {
+            lenient(EntryInfo {
+                size,
+                ..infos[1].clone()
+            });
+        }
+        lenient(EntryInfo {
+            crc32: infos[1].crc32 ^ 1,
+            ..infos[1].clone()
+        });
+    }
+}
+
+#[test]
+fn get_mut_forgets_the_position() {
+    let bytes = varied_jar(false);
+    let infos = infos(&bytes);
+    let mut reader = entry_reader(&bytes);
+    assert_eq!(
+        prefix(&mut reader, &infos[0]).expect("first"),
+        want_prefix(&bytes, &infos[0], 8)
+    );
+    let mut whole = Vec::new();
+    read_entry(reader.get_mut(), &infos[7], u64::MAX / 2, &mut whole).expect("read_entry");
+    assert_eq!(whole, want_prefix(&bytes, &infos[7], usize::MAX));
+    for i in [1, 2, 8] {
+        assert_eq!(
+            prefix(&mut reader, &infos[i]).expect("after get_mut"),
+            want_prefix(&bytes, &infos[i], 8),
+            "{}",
+            infos[i].name
+        );
+    }
 }

@@ -1,9 +1,9 @@
-use std::io::{self, Read, Seek, SeekFrom};
+use std::io::{self, BufRead, Read, Seek, SeekFrom};
 use std::ops::Range;
 
 use anyhow::{Context, anyhow, bail};
-use flate2::Crc;
 use flate2::read::DeflateDecoder;
+use flate2::{Crc, Decompress, FlushDecompress, Status};
 
 const EOCD_SIG: [u8; 4] = *b"PK\x05\x06";
 const EOCD_LEN: usize = 22;
@@ -84,27 +84,9 @@ pub fn read_entry<R: Read + Seek>(
     cap: u64,
     out: &mut Vec<u8>,
 ) -> anyhow::Result<()> {
-    if entry.flags & FLAG_ENCRYPTED != 0 {
-        bail!("encrypted entry");
-    }
-    if !matches!(entry.method, METHOD_STORED | METHOD_DEFLATED) {
-        bail!("unsupported compression method {}", entry.method);
-    }
-
-    let mut h = [0u8; LOCAL_LEN];
+    check_supported(entry.flags, entry.method)?;
     reader.seek(SeekFrom::Start(entry.header_offset))?;
-    reader.read_exact(&mut h).map_err(|e| match e.kind() {
-        io::ErrorKind::UnexpectedEof => anyhow!("local header is truncated"),
-        _ => e.into(),
-    })?;
-    if h[..4] != LOCAL_SIG {
-        bail!("invalid local header signature");
-    }
-    // The local lengths can differ from the central ones, so only they locate the data.
-    let data_start = entry
-        .header_offset
-        .checked_add(LOCAL_LEN as u64 + u64::from(le16(&h, 26)) + u64::from(le16(&h, 28)))
-        .context("local header offset is too large")?;
+    let data_start = read_local_header(reader, entry.header_offset)?;
     reader.seek(SeekFrom::Start(data_start))?;
 
     let start = out.len();
@@ -122,18 +104,171 @@ pub fn read_entry<R: Read + Seek>(
     if read > cap {
         return Ok(());
     }
-    if read != entry.size {
-        bail!(
-            "size is {read} bytes, central directory says {}",
-            entry.size
-        );
+    check_size_and_crc(&out[start..], entry.size, entry.crc32)
+}
+
+fn check_supported(flags: u16, method: u16) -> anyhow::Result<()> {
+    if flags & FLAG_ENCRYPTED != 0 {
+        bail!("encrypted entry");
+    }
+    if !matches!(method, METHOD_STORED | METHOD_DEFLATED) {
+        bail!("unsupported compression method {method}");
+    }
+    Ok(())
+}
+
+// Leaves the reader right after the fixed 30-byte header.
+fn read_local_header<R: Read>(reader: &mut R, header_offset: u64) -> anyhow::Result<u64> {
+    let mut h = [0u8; LOCAL_LEN];
+    reader.read_exact(&mut h).map_err(|e| match e.kind() {
+        io::ErrorKind::UnexpectedEof => anyhow!("local header is truncated"),
+        _ => e.into(),
+    })?;
+    if h[..4] != LOCAL_SIG {
+        bail!("invalid local header signature");
+    }
+    // The local lengths can differ from the central ones, so only they locate the data.
+    header_offset
+        .checked_add(LOCAL_LEN as u64 + u64::from(le16(&h, 26)) + u64::from(le16(&h, 28)))
+        .context("local header offset is too large")
+}
+
+fn check_size_and_crc(data: &[u8], size: u64, crc32: u32) -> anyhow::Result<()> {
+    let read = data.len() as u64;
+    if read != size {
+        bail!("size is {read} bytes, central directory says {size}");
     }
     let mut crc = Crc::new();
-    crc.update(&out[start..]);
-    if crc.sum() != entry.crc32 {
+    crc.update(data);
+    if crc.sum() != crc32 {
         bail!("CRC-32 mismatch");
     }
     Ok(())
+}
+
+pub struct EntryReader<R> {
+    reader: R,
+    pos: Option<u64>,
+    // One inflate state reset per entry: a fresh decoder per class would allocate its window
+    // and tables for every class of the archive.
+    inflate: Decompress,
+}
+
+impl<R: BufRead + Seek> EntryReader<R> {
+    pub fn new(reader: R) -> Self {
+        Self {
+            reader,
+            pos: None,
+            inflate: Decompress::new(false),
+        }
+    }
+
+    pub fn get_mut(&mut self) -> &mut R {
+        self.pos = None;
+        &mut self.reader
+    }
+
+    pub fn read_prefix(&mut self, entry: &Entry<'_>, out: &mut [u8]) -> anyhow::Result<usize> {
+        let result = self.try_read_prefix(entry, out);
+        if result.is_err() {
+            self.pos = None;
+        }
+        result
+    }
+
+    fn try_read_prefix(&mut self, entry: &Entry<'_>, out: &mut [u8]) -> anyhow::Result<usize> {
+        check_supported(entry.flags, entry.method)?;
+        self.seek_to(entry.header_offset)?;
+        let data_start = read_local_header(&mut self.reader, entry.header_offset)?;
+        self.pos = Some(entry.header_offset + LOCAL_LEN as u64);
+        self.seek_to(data_start)?;
+
+        let n = if entry.method == METHOD_STORED {
+            self.read_stored(entry.compressed_size, out)?
+        } else {
+            self.read_deflated(entry.compressed_size, out)?
+        };
+
+        // As 0.3.2, which read 8 bytes through `zip`: more than the declared size fails at
+        // once, but the CRC only runs when the data ends before `out` is full, so an entry of
+        // `out.len()` bytes or more with a wrong CRC stays readable.
+        if n as u64 > entry.size {
+            bail!(
+                "data is larger than the {} bytes the central directory says",
+                entry.size
+            );
+        }
+        if n < out.len() {
+            check_size_and_crc(&out[..n], entry.size, entry.crc32)?;
+        }
+        Ok(n)
+    }
+
+    // `seek_relative` keeps `BufReader`'s buffer when the target is inside it, which it often
+    // is for small entries read in archive order; an absolute seek always discards it.
+    fn seek_to(&mut self, target: u64) -> io::Result<()> {
+        let ahead = self
+            .pos
+            .and_then(|pos| target.checked_sub(pos))
+            .and_then(|d| i64::try_from(d).ok());
+        match ahead {
+            Some(0) => {}
+            Some(d) => self.reader.seek_relative(d)?,
+            None => {
+                self.reader.seek(SeekFrom::Start(target))?;
+            }
+        }
+        self.pos = Some(target);
+        Ok(())
+    }
+
+    fn advance(&mut self, n: usize) {
+        self.pos = self.pos.map(|pos| pos + n as u64);
+    }
+
+    fn read_stored(&mut self, compressed_size: u64, out: &mut [u8]) -> anyhow::Result<usize> {
+        let n = usize::try_from(compressed_size).map_or(out.len(), |c| c.min(out.len()));
+        self.reader
+            .read_exact(&mut out[..n])
+            .map_err(|e| match e.kind() {
+                io::ErrorKind::UnexpectedEof => anyhow!("entry data is truncated"),
+                _ => e.into(),
+            })?;
+        self.advance(n);
+        Ok(n)
+    }
+
+    fn read_deflated(&mut self, compressed_size: u64, out: &mut [u8]) -> anyhow::Result<usize> {
+        self.inflate.reset(false);
+        let mut left = compressed_size;
+        let mut n = 0;
+        while n < out.len() {
+            let buf = if left == 0 {
+                &[][..]
+            } else {
+                self.reader.fill_buf()?
+            };
+            let input = &buf[..usize::try_from(left).map_or(buf.len(), |l| l.min(buf.len()))];
+            let (in_before, out_before) = (self.inflate.total_in(), self.inflate.total_out());
+            let status = self
+                .inflate
+                .decompress(input, &mut out[n..], FlushDecompress::None)?;
+            let consumed = (self.inflate.total_in() - in_before) as usize;
+            let produced = (self.inflate.total_out() - out_before) as usize;
+            self.reader.consume(consumed);
+            self.advance(consumed);
+            left -= consumed as u64;
+            n += produced;
+            if status == Status::StreamEnd {
+                break;
+            }
+            // Bits already inside the decoder can still yield output after the input runs out.
+            if consumed == 0 && produced == 0 {
+                bail!("deflate data is truncated");
+            }
+        }
+        Ok(n)
+    }
 }
 
 pub struct CentralDirectory<R> {
