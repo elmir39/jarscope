@@ -293,6 +293,65 @@ fn manifest_with_broken_local_header_is_empty() {
     assert_eq!((r.entries, r.classes), (2, 1));
 }
 
+// Signed JARs list every file after the main section; only the main section is parsed.
+fn signed_manifest(files: usize) -> Vec<u8> {
+    let mut text = manifest_bytes(ATTRS);
+    text.extend_from_slice(b"\r\n");
+    for i in 0..files {
+        let section = format!("Name: org/x/C{i}.class\r\nSHA-256-Digest: {i:044}=\r\n\r\n");
+        text.extend_from_slice(section.as_bytes());
+    }
+    text
+}
+
+#[test]
+fn signed_manifest_reads_the_main_section() {
+    let dir = TempDir::new().expect("tempdir");
+    // ~80 bytes per section: about 0.8 MiB, and 2.4 MiB to also pass the 1 MiB cap.
+    for files in [10_000, 30_000] {
+        let entries = [
+            ("META-INF/MANIFEST.MF", signed_manifest(files)),
+            ("META-INF/versions/11/a/V.class", class_bytes(0, 55)),
+            ("a/Main.class", class_bytes(0, 52)),
+        ];
+        let deflated = make_jar(dir.path(), &format!("d{files}.jar"), &entries);
+        let stored = write(
+            dir.path(),
+            &format!("s{files}.jar"),
+            &stored_jar_bytes(&entries),
+        );
+        for jar in [deflated, stored] {
+            assert_manifest_read(&jar);
+            let s = scan_jar(&jar).expect("scan");
+            assert_eq!(s.manifest, Some(manifest_with(ATTRS)));
+            assert_eq!(s.versioned.len(), 1, "{}", jar.display());
+        }
+    }
+}
+
+// The CRC covers the whole manifest, so a damage after the main section must still be noticed.
+#[test]
+fn manifest_with_a_wrong_crc_is_empty() {
+    let dir = TempDir::new().expect("tempdir");
+    let mut bytes = stored_jar_bytes(&[
+        ("META-INF/MANIFEST.MF", signed_manifest(1000)),
+        ("a/Main.class", class_bytes(0, 52)),
+    ]);
+    let central = bytes
+        .windows(4)
+        .position(|w| w == b"PK\x01\x02")
+        .expect("central header");
+    bytes[central + 16] ^= 1;
+    let jar = write(dir.path(), "bad-crc.jar", &bytes);
+    let r = info(&jar);
+    assert_eq!(r.manifest, Some(Manifest::default()));
+    assert!(!r.multi_release);
+    assert_eq!(
+        scan_jar(&jar).expect("scan").manifest,
+        Some(Manifest::default())
+    );
+}
+
 #[test]
 fn duplicated_manifest_last_record_wins() {
     let dir = TempDir::new().expect("tempdir");

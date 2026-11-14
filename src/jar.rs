@@ -5,7 +5,9 @@ use std::path::Path;
 
 use anyhow::Context;
 
-use crate::cdir::{CentralDirectory, ENTRY_READER_CAPACITY, EntryInfo, EntryReader, read_entry};
+use crate::cdir::{
+    CentralDirectory, ENTRY_READER_CAPACITY, EntryInfo, EntryReader, read_entry_until,
+};
 use crate::classfile::parse_header;
 use crate::manifest::{Manifest, parse_manifest};
 
@@ -281,15 +283,36 @@ fn look_ahead_manifest<R: BufRead + Seek>(
     Ok(last.map(|entry| read_manifest_entry(reader.get_mut(), &entry)))
 }
 
+// `parse_manifest` reads only the main section, up to the first empty line. Signed JARs add a
+// section per file after it (884 KB on bcprov), so keeping it would cost ~3 MiB for nothing.
 fn read_manifest_entry<R: Read + Seek>(reader: &mut R, entry: &EntryInfo) -> Manifest {
     let mut bytes = Vec::new();
-    match read_entry(reader, entry, MANIFEST_LIMIT, &mut bytes) {
+    let mut scanned = 0;
+    let done = |kept: &[u8]| {
+        let found = main_section_ends(kept, scanned);
+        scanned = kept.len();
+        found
+    };
+    match read_entry_until(reader, entry, MANIFEST_LIMIT, &mut bytes, done) {
         Ok(()) => {
             bytes.truncate(MANIFEST_LIMIT as usize);
             parse_manifest(&bytes)
         }
         Err(_) => Manifest::default(),
     }
+}
+
+// An empty line as `parse_manifest` sees it: a line break at the very start, or two breaks in
+// a row, where "\r\n" is one break. `from` skips bytes already checked.
+fn main_section_ends(bytes: &[u8], from: usize) -> bool {
+    if matches!(bytes.first(), Some(b'\r' | b'\n')) {
+        return true;
+    }
+    bytes
+        .get(from.saturating_sub(1)..)
+        .unwrap_or_default()
+        .windows(2)
+        .any(|w| matches!(w, [b'\n', b'\n' | b'\r'] | [b'\r', b'\r']))
 }
 
 #[cfg(test)]
@@ -366,5 +389,56 @@ mod tests {
     #[test]
     fn classify_case_sensitive_prefix() {
         assert_eq!(c("meta-inf/versions/11/X.class"), EntryKind::Class);
+    }
+
+    // Every manifest up to 7 bytes over these symbols: feeding bytes one at a time, the prefix
+    // kept when `main_section_ends` first fires parses exactly like the whole text.
+    #[test]
+    fn main_section_prefix_parses_like_the_whole_manifest() {
+        const SYMBOLS: [u8; 5] = *b"a: \r\n";
+        for len in 0..=7u32 {
+            for mut code in 0..SYMBOLS.len().pow(len) {
+                let text: Vec<u8> = (0..len)
+                    .map(|_| {
+                        let b = SYMBOLS[code % SYMBOLS.len()];
+                        code /= SYMBOLS.len();
+                        b
+                    })
+                    .collect();
+                let mut scanned = 0;
+                let cut = (1..=text.len()).find(|&n| {
+                    let found = main_section_ends(&text[..n], scanned);
+                    scanned = n;
+                    found
+                });
+                if let Some(n) = cut {
+                    assert_eq!(
+                        parse_manifest(&text[..n]),
+                        parse_manifest(&text),
+                        "{:?}",
+                        String::from_utf8_lossy(&text)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn main_section_ends_at_the_first_empty_line() {
+        for text in [
+            "A: b\n\n",
+            "A: b\r\n\r\n",
+            "A: b\r\rC",
+            "A: b\n\rC",
+            "\nA: b",
+            "\rA",
+        ] {
+            assert!(main_section_ends(text.as_bytes(), 0), "{text:?}");
+        }
+        for text in ["A: b\r\n", "A: b\nC: d\r\n", "A: b\r\nC: d", ""] {
+            assert!(!main_section_ends(text.as_bytes(), 0), "{text:?}");
+        }
+        // `from` resumes one byte back, so a break split across two reads is still seen.
+        assert!(main_section_ends(b"A: b\n\n", 5));
     }
 }

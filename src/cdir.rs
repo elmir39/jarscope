@@ -87,11 +87,7 @@ pub fn read_entry<R: Read + Seek>(
     cap: u64,
     out: &mut Vec<u8>,
 ) -> anyhow::Result<()> {
-    check_supported(entry.flags, entry.method)?;
-    reader.seek(SeekFrom::Start(entry.header_offset))?;
-    let data_start = read_local_header(reader, entry.header_offset)?;
-    reader.seek(SeekFrom::Start(data_start))?;
-
+    seek_to_data(reader, entry)?;
     let start = out.len();
     out.reserve(entry.size.min(cap).min(RESERVE_LIMIT) as usize);
     let data = reader.take(entry.compressed_size);
@@ -108,6 +104,68 @@ pub fn read_entry<R: Read + Seek>(
         return Ok(());
     }
     check_size_and_crc(&out[start..], entry.size, entry.crc32)
+}
+
+// Like `read_entry`, but stops keeping bytes once `done(kept)` says the rest isn't needed.
+// The rest is still decompressed through a small buffer, so size and CRC are checked exactly
+// as `read_entry` checks them, without holding the whole entry in memory.
+pub fn read_entry_until<R: Read + Seek>(
+    reader: &mut R,
+    entry: &EntryInfo,
+    cap: u64,
+    out: &mut Vec<u8>,
+    mut done: impl FnMut(&[u8]) -> bool,
+) -> anyhow::Result<()> {
+    seek_to_data(reader, entry)?;
+    let start = out.len();
+    let data = reader.take(entry.compressed_size);
+    let limit = cap.saturating_add(1);
+    let (read, crc) = if entry.method == METHOD_STORED {
+        drain(data.take(limit), out, start, &mut done)
+    } else {
+        drain(DeflateDecoder::new(data).take(limit), out, start, &mut done)
+    }
+    .map_err(|e| anyhow!(e))?;
+
+    if read > cap {
+        return Ok(());
+    }
+    check_size_and_crc_values(read, crc, entry.size, entry.crc32)
+}
+
+fn drain(
+    mut data: impl Read,
+    out: &mut Vec<u8>,
+    start: usize,
+    done: &mut impl FnMut(&[u8]) -> bool,
+) -> io::Result<(u64, u32)> {
+    let mut buf = [0u8; 8192];
+    let mut crc = Crc::new();
+    let mut read = 0u64;
+    let mut keep = true;
+    loop {
+        let n = match data.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
+        crc.update(&buf[..n]);
+        read += n as u64;
+        if keep {
+            out.extend_from_slice(&buf[..n]);
+            keep = !done(&out[start..]);
+        }
+    }
+    Ok((read, crc.sum()))
+}
+
+fn seek_to_data<R: Read + Seek>(reader: &mut R, entry: &EntryInfo) -> anyhow::Result<()> {
+    check_supported(entry.flags, entry.method)?;
+    reader.seek(SeekFrom::Start(entry.header_offset))?;
+    let data_start = read_local_header(reader, entry.header_offset)?;
+    reader.seek(SeekFrom::Start(data_start))?;
+    Ok(())
 }
 
 fn check_supported(flags: u16, method: u16) -> anyhow::Result<()> {
@@ -137,13 +195,16 @@ fn read_local_header<R: Read>(reader: &mut R, header_offset: u64) -> anyhow::Res
 }
 
 fn check_size_and_crc(data: &[u8], size: u64, crc32: u32) -> anyhow::Result<()> {
-    let read = data.len() as u64;
+    let mut crc = Crc::new();
+    crc.update(data);
+    check_size_and_crc_values(data.len() as u64, crc.sum(), size, crc32)
+}
+
+fn check_size_and_crc_values(read: u64, crc: u32, size: u64, crc32: u32) -> anyhow::Result<()> {
     if read != size {
         bail!("size is {read} bytes, central directory says {size}");
     }
-    let mut crc = Crc::new();
-    crc.update(data);
-    if crc.sum() != crc32 {
+    if crc != crc32 {
         bail!("CRC-32 mismatch");
     }
     Ok(())

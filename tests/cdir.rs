@@ -3,7 +3,9 @@ mod common;
 use std::io::{BufRead, BufReader, Cursor, Seek, Write};
 
 use common::{RawEntry, RawZip, ZIP64_MARK, extra_field, raw_zip, unicode_path_extra};
-use jarscope::cdir::{CentralDirectory, Entry, EntryInfo, EntryReader, read_entry};
+use jarscope::cdir::{
+    CentralDirectory, Entry, EntryInfo, EntryReader, read_entry, read_entry_until,
+};
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
@@ -1574,5 +1576,92 @@ fn get_mut_forgets_the_position() {
             "{}",
             infos[i].name
         );
+    }
+}
+
+fn read_until(
+    bytes: &[u8],
+    info: &EntryInfo,
+    cap: u64,
+    done: impl FnMut(&[u8]) -> bool,
+) -> anyhow::Result<Vec<u8>> {
+    let mut out = Vec::new();
+    read_entry_until(&mut Cursor::new(bytes), info, cap, &mut out, done)?;
+    Ok(out)
+}
+
+fn noise(len: usize) -> Vec<u8> {
+    let mut x = 0x9E37_79B9_7F4A_7C15u64;
+    (0..len)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x as u8
+        })
+        .collect()
+}
+
+#[test]
+fn read_entry_until_keeps_only_what_is_needed() {
+    let data = noise(1 << 20);
+    for bytes in [
+        deflated(&[("big", &data)], false),
+        common::stored_jar_bytes(&[("big", data.clone())]),
+    ] {
+        let info = &infos(&bytes)[0];
+        let out = read_until(&bytes, info, u64::MAX / 2, |kept| kept.len() >= 10).expect("read");
+        assert!(out.len() >= 10 && out.len() <= 8192 + 10, "{}", out.len());
+        assert_eq!(out, data[..out.len()]);
+    }
+}
+
+#[test]
+fn read_entry_until_reads_everything_like_read_entry() {
+    let data = noise(100_000);
+    for bytes in [
+        deflated(&[("big", &data)], false),
+        deflated(&[("big", &data)], true),
+        common::stored_jar_bytes(&[("big", data.clone())]),
+    ] {
+        let info = &infos(&bytes)[0];
+        for cap in [0, 1, 99_999, 100_000, u64::MAX / 2] {
+            assert_eq!(
+                read_until(&bytes, info, cap, |_| false).expect("until"),
+                read_with(&bytes, info, cap).expect("read_entry"),
+                "cap {cap}"
+            );
+        }
+    }
+}
+
+// Stopping early must not skip the checks: they run over the whole entry, as in `read_entry`.
+#[test]
+fn read_entry_until_still_checks_size_and_crc() {
+    let data = noise(100_000);
+    for bytes in [
+        deflated(&[("big", &data)], false),
+        common::stored_jar_bytes(&[("big", data.clone())]),
+    ] {
+        let good = &infos(&bytes)[0];
+        let stop = |kept: &[u8]| !kept.is_empty();
+
+        let bad_crc = EntryInfo {
+            crc32: good.crc32 ^ 1,
+            ..good.clone()
+        };
+        let err = read_until(&bytes, &bad_crc, u64::MAX / 2, stop).expect_err("crc");
+        assert_eq!(format!("{err:#}"), "CRC-32 mismatch");
+        assert_eq!(read_entry_err(&bytes, &bad_crc), "CRC-32 mismatch");
+
+        let bad_size = EntryInfo {
+            size: good.size + 1,
+            ..good.clone()
+        };
+        let err = read_until(&bytes, &bad_size, u64::MAX / 2, stop).expect_err("size");
+        assert_eq!(format!("{err:#}"), read_entry_err(&bytes, &bad_size));
+
+        // Over the cap the caller discards the data, so no checks, as in `read_entry`.
+        assert!(read_until(&bytes, &bad_crc, 1000, stop).is_ok());
     }
 }
