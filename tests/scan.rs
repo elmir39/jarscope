@@ -1,11 +1,19 @@
 mod common;
 
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::io::{Cursor, Write};
+use std::path::{Path, PathBuf};
 
-use common::{class_bytes, make_jar, make_jar_with_manifest};
-use jarscope::jar::{JarReport, scan_jar};
+use common::{
+    RawEntry, RawZip, class_bytes, make_jar, make_jar_with_manifest, manifest_bytes, raw_zip,
+    stored_jar_bytes,
+};
+use jarscope::cdir::CentralDirectory;
+use jarscope::jar::{JarReport, read_info, scan_jar};
+use jarscope::manifest::parse_manifest;
 use tempfile::TempDir;
+use zip::write::SimpleFileOptions;
+use zip::{CompressionMethod, ZipWriter};
 
 const MR: &[(&str, &str)] = &[("Multi-Release", "true")];
 
@@ -369,4 +377,259 @@ fn truncated_jar_is_error() {
     let bytes = std::fs::read(&jar).expect("read");
     std::fs::write(&jar, &bytes[..bytes.len() / 2]).expect("write");
     assert!(scan_jar(&jar).is_err());
+}
+
+fn write(dir: &Path, name: &str, bytes: &[u8]) -> PathBuf {
+    let path = dir.join(name);
+    std::fs::write(&path, bytes).expect("write jar");
+    path
+}
+
+fn versioned(pairs: &[(u32, u16, usize)]) -> BTreeMap<u32, BTreeMap<u16, usize>> {
+    let mut out: BTreeMap<u32, BTreeMap<u16, usize>> = BTreeMap::new();
+    for &(release, major, n) in pairs {
+        out.entry(release).or_default().insert(major, n);
+    }
+    out
+}
+
+// Classes on both sides of the manifest record: only a look-ahead knows `Multi-Release`.
+fn manifest_last(attrs: &[(&str, &str)]) -> Vec<(&'static str, Vec<u8>)> {
+    vec![
+        ("META-INF/versions/17/com/A.class", class_bytes(0, 61)),
+        ("com/A.class", class_bytes(0, 52)),
+        ("META-INF/MANIFEST.MF", manifest_bytes(attrs)),
+        ("META-INF/versions/21/com/B.class", class_bytes(0, 65)),
+    ]
+}
+
+#[test]
+fn manifest_after_versioned_classes_with_multi_release() {
+    let dir = TempDir::new().expect("tempdir");
+    let jar = make_jar(dir.path(), "a.jar", &manifest_last(MR));
+    let r = scan(&jar);
+    assert!(r.multi_release);
+    assert_eq!(r.versioned, versioned(&[(17, 61, 1), (21, 65, 1)]));
+    assert_eq!(r.ignored_versioned, 0);
+    assert_eq!(r.base, counts(&[(52, 1)]));
+    assert_eq!(r.manifest, read_info(&jar).expect("info").manifest);
+    assert_eq!(r.manifest, Some(parse_manifest(&manifest_bytes(MR))));
+}
+
+#[test]
+fn manifest_after_versioned_classes_without_multi_release() {
+    let dir = TempDir::new().expect("tempdir");
+    let attrs = &[("Main-Class", "com.A")];
+    let jar = make_jar(dir.path(), "a.jar", &manifest_last(attrs));
+    let r = scan(&jar);
+    assert!(!r.multi_release);
+    assert!(r.versioned.is_empty());
+    assert_eq!(r.ignored_versioned, 2);
+    assert_eq!(r.base, counts(&[(52, 1)]));
+    assert_eq!(r.manifest, Some(parse_manifest(&manifest_bytes(attrs))));
+
+    let mut entries = manifest_last(MR);
+    entries.retain(|(name, _)| *name != "META-INF/MANIFEST.MF");
+    let jar = make_jar(dir.path(), "none.jar", &entries);
+    let r = scan(&jar);
+    assert!(!r.multi_release);
+    assert_eq!(r.manifest, None);
+    assert_eq!(r.ignored_versioned, 2);
+    assert_eq!(r.base, counts(&[(52, 1)]));
+}
+
+#[test]
+fn duplicated_manifest_last_record_wins() {
+    let dir = TempDir::new().expect("tempdir");
+    let plain = manifest_bytes(&[("Main-Class", "a.Main")]);
+    let mr = manifest_bytes(MR);
+    let class = RawEntry::new("META-INF/versions/17/a/A.class", class_bytes(0, 61));
+    for (name, first, last, counted) in [
+        ("mr-first.jar", &mr, &plain, false),
+        ("mr-last.jar", &plain, &mr, true),
+    ] {
+        let bytes = raw_zip(
+            &[
+                RawEntry::new("META-INF/MANIFEST.MF", first),
+                class.clone(),
+                RawEntry::new("META-INF/MANIFEST.MF", last),
+            ],
+            &RawZip::default(),
+        );
+        let jar = write(dir.path(), name, &bytes);
+        let r = scan(&jar);
+        assert_eq!(r.multi_release, counted, "{name}");
+        assert_eq!(r.manifest, Some(parse_manifest(last)), "{name}");
+        assert_eq!(
+            r.manifest,
+            read_info(&jar).expect("info").manifest,
+            "{name}"
+        );
+        if counted {
+            assert_eq!(r.versioned, versioned(&[(17, 61, 1)]), "{name}");
+            assert_eq!(r.ignored_versioned, 0, "{name}");
+        } else {
+            assert!(r.versioned.is_empty(), "{name}");
+            assert_eq!(r.ignored_versioned, 1, "{name}");
+        }
+
+        // Without versioned classes the main pass alone picks the last record.
+        let bytes = raw_zip(
+            &[
+                RawEntry::new("META-INF/MANIFEST.MF", first),
+                RawEntry::new("a/A.class", class_bytes(0, 52)),
+                RawEntry::new("META-INF/MANIFEST.MF", last),
+            ],
+            &RawZip::default(),
+        );
+        let jar = write(dir.path(), name, &bytes);
+        let r = scan(&jar);
+        assert_eq!(r.multi_release, counted, "{name}");
+        assert_eq!(r.manifest, Some(parse_manifest(last)), "{name}");
+    }
+}
+
+fn find_from(bytes: &[u8], from: usize, needle: &[u8]) -> usize {
+    from + bytes[from..]
+        .windows(needle.len())
+        .position(|w| w == needle)
+        .expect("needle")
+}
+
+// The first occurrence of a name is in its local header, which starts 30 bytes earlier
+// (`raw_zip` writes the local name as is).
+fn break_local_header_of(bytes: &mut [u8], name: &str) {
+    let start = find_from(bytes, 0, name.as_bytes()) - 30;
+    assert_eq!(&bytes[start..start + 4], b"PK\x03\x04");
+    bytes[start + 2] = 0;
+}
+
+#[test]
+fn ignored_versioned_classes_are_never_read() {
+    let dir = TempDir::new().expect("tempdir");
+    let name = "META-INF/versions/17/a/A.class";
+    for (jar, attrs) in [("plain.jar", &[][..]), ("mr.jar", MR)] {
+        let mut bytes = raw_zip(
+            &[
+                RawEntry::new("META-INF/MANIFEST.MF", manifest_bytes(attrs)),
+                RawEntry::new("a/A.class", class_bytes(0, 52)),
+                RawEntry::new(name, class_bytes(0, 61)),
+            ],
+            &RawZip::default(),
+        );
+        break_local_header_of(&mut bytes, name);
+        let r = scan(&write(dir.path(), jar, &bytes));
+        assert_eq!(r.base, counts(&[(52, 1)]), "{jar}");
+        assert!(r.versioned.is_empty(), "{jar}");
+        if attrs.is_empty() {
+            assert_eq!(r.ignored_versioned, 1);
+            assert!(r.invalid.is_empty(), "{:?}", r.invalid);
+        } else {
+            assert_eq!(r.ignored_versioned, 0);
+            assert_eq!(
+                r.invalid,
+                [(
+                    name.to_string(),
+                    "invalid local header signature".to_string()
+                )]
+            );
+        }
+    }
+}
+
+fn report_entries(zip64: bool) -> Vec<RawEntry> {
+    [
+        ("META-INF/MANIFEST.MF", manifest_bytes(MR)),
+        ("a/", Vec::new()),
+        ("a/A.class", class_bytes(0, 52)),
+        ("a/P.class", class_bytes(0xFFFF, 61)),
+        ("module-info.class", class_bytes(0, 53)),
+        ("META-INF/versions/17/a/A.class", class_bytes(0, 61)),
+        ("a/Bad.class", vec![0xDE, 0xAD, 0xBE, 0xEF, 0, 0, 0, 52]),
+    ]
+    .into_iter()
+    .map(|(name, data)| RawEntry {
+        zip64,
+        ..RawEntry::new(name, data)
+    })
+    .collect()
+}
+
+#[test]
+fn prepended_data_stored_and_zip64_give_the_same_report() {
+    let dir = TempDir::new().expect("tempdir");
+    let plain = scan(&write(
+        dir.path(),
+        "plain.jar",
+        &raw_zip(&report_entries(false), &RawZip::default()),
+    ));
+    assert_eq!(plain.base, counts(&[(52, 1), (61, 1)]));
+    assert_eq!(plain.versioned, versioned(&[(17, 61, 1)]));
+    assert_eq!(plain.preview, [("a/P.class".to_string(), 61)]);
+    assert_eq!(plain.module_info, [("module-info.class".to_string(), 53)]);
+    assert_eq!(
+        plain.invalid,
+        [("a/Bad.class".to_string(), "bad magic".to_string())]
+    );
+
+    let raw = report_entries(false);
+    let named: Vec<(&str, Vec<u8>)> = raw
+        .iter()
+        .map(|e| (std::str::from_utf8(&e.name).expect("name"), e.data.clone()))
+        .collect();
+    let deflated = scan(&make_jar(dir.path(), "deflated.jar", &named));
+    assert_eq!(deflated, plain, "deflated");
+    let stored = scan(&write(dir.path(), "stored.jar", &stored_jar_bytes(&named)));
+    assert_eq!(stored, plain, "stored");
+
+    let script = b"#!/bin/sh\nexec java -jar \"$0\" \"$@\"\n".repeat(3);
+    for (name, zip64, prefix) in [
+        ("prefixed.jar", false, script.clone()),
+        ("zip64.jar", true, Vec::new()),
+        ("prefixed-zip64.jar", true, script),
+    ] {
+        let opts = RawZip {
+            zip64,
+            prefix,
+            ..RawZip::default()
+        };
+        let r = scan(&write(
+            dir.path(),
+            name,
+            &raw_zip(&report_entries(zip64), &opts),
+        ));
+        assert_eq!(r, plain, "{name}");
+    }
+}
+
+#[test]
+fn data_descriptors_give_the_right_versions() {
+    let dir = TempDir::new().expect("tempdir");
+    let mut big = class_bytes(0, 65);
+    big.extend((0..20_000u32).flat_map(|i| i.to_le_bytes()));
+    let entries = [
+        ("META-INF/MANIFEST.MF", manifest_bytes(MR)),
+        ("a/A.class", class_bytes(0, 52)),
+        ("a/Big.class", big),
+        ("META-INF/versions/17/a/A.class", class_bytes(0, 61)),
+        ("a/C.class", class_bytes(0, 55)),
+    ];
+    let mut bytes = Vec::new();
+    let mut zip = ZipWriter::new_stream(&mut bytes);
+    let opts = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+    for (name, data) in &entries {
+        zip.start_file(*name, opts).expect("file");
+        zip.write_all(data).expect("write");
+    }
+    zip.finish().expect("finish");
+    let mut cd = CentralDirectory::new(Cursor::new(&bytes)).expect("cdir");
+    while let Some(e) = cd.next_entry().expect("entry") {
+        assert_ne!(e.flags & 0x8, 0, "{} has no data descriptor", e.name);
+    }
+
+    let r = scan(&write(dir.path(), "streamed.jar", &bytes));
+    assert!(r.multi_release);
+    assert_eq!(r.base, counts(&[(52, 1), (55, 1), (65, 1)]));
+    assert_eq!(r.versioned, versioned(&[(17, 61, 1)]));
+    assert!(r.invalid.is_empty(), "{:?}", r.invalid);
 }

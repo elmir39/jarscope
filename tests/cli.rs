@@ -193,7 +193,7 @@ fn list_classes_only() {
 }
 
 #[test]
-fn duplicate_names_are_listed_and_counted_but_version_warns() {
+fn duplicate_names_are_listed_and_counted() {
     let dir = TempDir::new().expect("tempdir");
     let jar = make_jar_with_duplicate(dir.path(), "d.jar", class_bytes(0, 52), class_bytes(0, 55));
     let run = |args: &[&str]| jarscope().args(args).arg(&jar).output().expect("run");
@@ -233,14 +233,84 @@ fn duplicate_names_are_listed_and_counted_but_version_warns() {
 
     let out = run(&["version"]);
     assert_eq!(out.status.code(), Some(0));
+    assert!(
+        out.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     assert_eq!(
-        String::from_utf8_lossy(&out.stderr),
-        format!(
-            "warning: {} has duplicate entry names; classes are counted once per name\n",
-            jar.display()
+        String::from_utf8_lossy(&out.stdout),
+        "Requires: Java 11 (major 55)\n\nClasses by Java version:\n  Java 8   1\n  Java 11  1\n"
+    );
+}
+
+// Each entry fails in a different place; `raw_zip` writes every entry stored, whatever its
+// method field says, so `Corrupt.class` is 0xFF bytes read as deflate.
+#[test]
+fn version_lists_each_invalid_class_and_goes_on() {
+    use common::{RawEntry, RawZip, raw_zip};
+    let dir = TempDir::new().expect("tempdir");
+    let class = class_bytes(0, 52);
+    let entries = [
+        RawEntry::new("a/A.class", &class),
+        RawEntry::new("a/BadMagic.class", [0xDE, 0xAD, 0xBE, 0xEF, 0, 0, 0, 52]),
+        RawEntry::new("a/Short.class", [0xCA, 0xFE, 0xBA]),
+        RawEntry {
+            method: 8,
+            ..RawEntry::new("a/Corrupt.class", [0xFF; 16])
+        },
+        RawEntry::new("a/BadLocal.class", &class),
+        RawEntry {
+            flags: 1,
+            ..RawEntry::new("a/Encrypted.class", &class)
+        },
+        RawEntry {
+            method: 12,
+            ..RawEntry::new("a/Bzip2.class", &class)
+        },
+        RawEntry::new("a/BadCrc.class", [0xCA, 0xFE, 0xBA, 0xBE, 0]),
+        RawEntry::new("a/B.class", class_bytes(0, 55)),
+    ];
+    let mut bytes = raw_zip(&entries, &RawZip::default());
+    let find = |bytes: &[u8], from: usize, name: &[u8]| {
+        from + bytes[from..]
+            .windows(name.len())
+            .position(|w| w == name)
+            .expect("name")
+    };
+    let local = find(&bytes, 0, b"a/BadLocal.class") - 30;
+    assert_eq!(&bytes[local..local + 4], b"PK\x03\x04");
+    bytes[local + 2] = 0;
+    // The second occurrence is the central header, 46 bytes after its start; CRC at +16.
+    let first = find(&bytes, 0, b"a/BadCrc.class");
+    let central = find(&bytes, first + 1, b"a/BadCrc.class") - 46;
+    assert_eq!(&bytes[central..central + 4], b"PK\x01\x02");
+    bytes[central + 16] ^= 0xFF;
+    let jar = dir.path().join("bad.jar");
+    std::fs::write(&jar, bytes).expect("write");
+
+    let out = jarscope().arg("version").arg(&jar).output().expect("run");
+    assert_eq!(out.status.code(), Some(0));
+    assert!(
+        out.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        concat!(
+            "Requires: Java 11 (major 55)\n\n",
+            "Classes by Java version:\n  Java 8   1\n  Java 11  1\n\n",
+            "Invalid class files: 7\n",
+            "  a/BadMagic.class: bad magic\n",
+            "  a/Short.class: truncated class header\n",
+            "  a/Corrupt.class: deflate decompression error: invalid block type\n",
+            "  a/BadLocal.class: invalid local header signature\n",
+            "  a/Encrypted.class: encrypted entry\n",
+            "  a/Bzip2.class: unsupported compression method 12\n",
+            "  a/BadCrc.class: CRC-32 mismatch\n",
         )
     );
-    assert!(String::from_utf8_lossy(&out.stdout).starts_with("Requires: Java 11 (major 55)\n"));
 }
 
 #[test]
@@ -248,7 +318,12 @@ fn central_directory_cut_in_the_middle_is_an_error() {
     let dir = TempDir::new().expect("tempdir");
     let jar = dir.path().join("cut.jar");
     std::fs::write(&jar, common::cut_jar_bytes()).expect("write");
-    for args in [&["list"][..], &["list", "--classes-only"], &["info"]] {
+    for args in [
+        &["list"][..],
+        &["list", "--classes-only"],
+        &["info"],
+        &["version"],
+    ] {
         let out = jarscope().args(args).arg(&jar).output().expect("run");
         assert_eq!(out.status.code(), Some(2), "{args:?}");
         assert!(out.stdout.is_empty(), "{args:?}");

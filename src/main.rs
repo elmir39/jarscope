@@ -85,15 +85,7 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
     match cli.command {
         Command::Version { jar } => match scan_jar(&jar) {
-            Ok(report) => {
-                if report.duplicate_names {
-                    stderr_line(&format!(
-                        "warning: {} has duplicate entry names; classes are counted once per name",
-                        jar.display()
-                    ));
-                }
-                write_stdout(&render_version(&report), ExitCode::SUCCESS)
-            }
+            Ok(report) => write_stdout(&render_version(&report), ExitCode::SUCCESS),
             Err(err) => fail(&err),
         },
         Command::List { jar, classes_only } => match read_names(&jar) {

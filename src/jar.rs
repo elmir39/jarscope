@@ -1,13 +1,12 @@
 use std::collections::BTreeMap;
 use std::fs::File;
-use std::io::{BufReader, Read, Seek};
+use std::io::{BufRead, BufReader, Read, Seek};
 use std::path::Path;
 
 use anyhow::Context;
-use zip::ZipArchive;
 
-use crate::cdir::{CentralDirectory, EntryInfo, read_entry};
-use crate::classfile::{ClassHeader, parse_header};
+use crate::cdir::{CentralDirectory, ENTRY_READER_CAPACITY, EntryInfo, EntryReader, read_entry};
+use crate::classfile::parse_header;
 use crate::manifest::{Manifest, parse_manifest};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -59,21 +58,7 @@ const MANIFEST_NAME: &str = "META-INF/MANIFEST.MF";
 // Caps memory use on hostile or zip-bomb manifests.
 const MANIFEST_LIMIT: u64 = 1 << 20;
 
-const HEADER_LEN: u64 = 8;
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Entry {
-    pub index: usize,
-    pub name: String,
-    pub size: u64,
-    pub compressed_size: u64,
-}
-
-impl Entry {
-    pub fn is_dir(&self) -> bool {
-        self.name.ends_with('/')
-    }
-}
+const HEADER_LEN: usize = 8;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct JarReport {
@@ -85,8 +70,6 @@ pub struct JarReport {
     pub module_info: Vec<(String, u16)>,
     pub invalid: Vec<(String, String)>,
     pub manifest: Option<Manifest>,
-    pub entries: Vec<Entry>,
-    pub duplicate_names: bool,
 }
 
 impl JarReport {
@@ -143,19 +126,16 @@ impl EntryNames {
     }
 }
 
-pub(crate) fn open(path: &Path) -> anyhow::Result<ZipArchive<BufReader<File>>> {
-    let file = File::open(path).with_context(|| format!("cannot open {}", path.display()))?;
-    // Unbuffered File means one syscall per small central-directory read; threads then contend in the kernel.
-    ZipArchive::new(BufReader::new(file)).with_context(|| invalid_jar(path))
-}
-
 pub(crate) fn invalid_jar(path: &Path) -> String {
     format!("{} is not a valid JAR/ZIP file", path.display())
 }
 
+fn open_file(path: &Path) -> anyhow::Result<File> {
+    File::open(path).with_context(|| format!("cannot open {}", path.display()))
+}
+
 pub(crate) fn open_cdir(path: &Path) -> anyhow::Result<CentralDirectory<BufReader<File>>> {
-    let file = File::open(path).with_context(|| format!("cannot open {}", path.display()))?;
-    CentralDirectory::new(BufReader::new(file)).with_context(|| invalid_jar(path))
+    CentralDirectory::new(BufReader::new(open_file(path)?)).with_context(|| invalid_jar(path))
 }
 
 pub fn read_info(path: &Path) -> anyhow::Result<JarInfo> {
@@ -194,24 +174,54 @@ pub fn read_names(path: &Path) -> anyhow::Result<EntryNames> {
 }
 
 pub fn scan_jar(path: &Path) -> anyhow::Result<JarReport> {
-    let mut archive = open(path)?;
-    let mut report = index(&mut archive);
+    let mut cd = open_cdir(path)?;
+    // A second `File::open`, not `try_clone`: a cloned descriptor shares the file offset on
+    // Unix, so the two buffered readers would move each other's position.
+    let data = BufReader::with_capacity(ENTRY_READER_CAPACITY, open_file(path)?);
+    let mut reader = EntryReader::new(data);
 
-    let mut buf = Vec::with_capacity(HEADER_LEN as usize);
-    for entry in &report.entries {
-        let kind = classify(&entry.name, entry.is_dir());
-        if kind == EntryKind::Other {
+    let mut report = JarReport::default();
+    let mut multi_release = None;
+    let mut manifest_entry = None;
+    let mut prefix = [0u8; HEADER_LEN];
+    while let Some(entry) = cd.next_entry().with_context(|| invalid_jar(path))? {
+        if entry.name == MANIFEST_NAME && multi_release.is_none() {
+            manifest_entry = Some(entry.to_info());
             continue;
         }
-        if matches!(kind, EntryKind::Versioned { .. }) && !report.multi_release {
-            report.ignored_versioned += 1;
-            continue;
+        let kind = classify(entry.name, entry.is_dir());
+        match kind {
+            EntryKind::Other => continue,
+            EntryKind::Versioned { .. } => {
+                let counted = match multi_release {
+                    Some(mr) => mr,
+                    None => {
+                        report.manifest = look_ahead_manifest(path, &mut reader)?;
+                        let mr = report
+                            .manifest
+                            .as_ref()
+                            .is_some_and(Manifest::is_multi_release);
+                        multi_release = Some(mr);
+                        mr
+                    }
+                };
+                if !counted {
+                    report.ignored_versioned += 1;
+                    continue;
+                }
+            }
+            EntryKind::Class | EntryKind::ModuleInfo { .. } => {}
         }
 
-        let header = match read_header(&mut archive, entry.index, &mut buf) {
+        let parsed = reader
+            .read_prefix(&entry, &mut prefix)
+            .and_then(|n| Ok(parse_header(&prefix[..n])?));
+        let header = match parsed {
             Ok(header) => header,
-            Err(reason) => {
-                report.invalid.push((entry.name.clone(), reason));
+            Err(e) => {
+                report
+                    .invalid
+                    .push((entry.name.to_string(), format!("{e:#}")));
                 continue;
             }
         };
@@ -228,54 +238,47 @@ pub fn scan_jar(path: &Path) -> anyhow::Result<JarReport> {
                     .or_default() += 1;
             }
             EntryKind::ModuleInfo { .. } => {
-                report.module_info.push((entry.name.clone(), header.major));
+                report
+                    .module_info
+                    .push((entry.name.to_string(), header.major));
                 continue;
             }
             EntryKind::Other => continue,
         }
         if header.is_preview() {
-            report.preview.push((entry.name.clone(), header.major));
+            report.preview.push((entry.name.to_string(), header.major));
+        }
+    }
+
+    match multi_release {
+        Some(mr) => report.multi_release = mr,
+        None => {
+            if let Some(entry) = manifest_entry {
+                let m = read_manifest_entry(reader.get_mut(), &entry);
+                report.multi_release = m.is_multi_release();
+                report.manifest = Some(m);
+            }
         }
     }
     Ok(report)
 }
 
-fn index<R: Read + Seek>(archive: &mut ZipArchive<R>) -> JarReport {
-    let manifest = read_manifest(archive);
-    let mut report = JarReport {
-        multi_release: manifest.as_ref().is_some_and(Manifest::is_multi_release),
-        manifest,
-        duplicate_names: archive.has_duplicate_names(),
-        entries: Vec::with_capacity(archive.len()),
-        ..JarReport::default()
-    };
-    for i in 0..archive.len() {
-        let entry = archive.by_index_data(i).and_then(|data| {
-            Ok(Entry {
-                index: i,
-                name: data.name()?.into_owned(),
-                size: data.size(),
-                compressed_size: data.compressed_size(),
-            })
-        });
-        match entry {
-            Ok(entry) => report.entries.push(entry),
-            Err(e) => report.invalid.push((format!("entry #{i}"), e.to_string())),
+// A versioned class can come before the manifest, and with a duplicated manifest the last
+// record wins, so only a pass over the whole directory decides `Multi-Release`.
+fn look_ahead_manifest<R: BufRead + Seek>(
+    path: &Path,
+    reader: &mut EntryReader<R>,
+) -> anyhow::Result<Option<Manifest>> {
+    let mut last = None;
+    {
+        let mut cd = CentralDirectory::new(reader.get_mut()).with_context(|| invalid_jar(path))?;
+        while let Some(entry) = cd.next_entry().with_context(|| invalid_jar(path))? {
+            if entry.name == MANIFEST_NAME {
+                last = Some(entry.to_info());
+            }
         }
     }
-    report
-}
-
-fn read_manifest<R: Read + Seek>(archive: &mut ZipArchive<R>) -> Option<Manifest> {
-    archive.index_for_name(MANIFEST_NAME)?;
-    let Ok(entry) = archive.by_name(MANIFEST_NAME) else {
-        return Some(Manifest::default());
-    };
-    let mut bytes = Vec::new();
-    match entry.take(MANIFEST_LIMIT).read_to_end(&mut bytes) {
-        Ok(_) => Some(parse_manifest(&bytes)),
-        Err(_) => Some(Manifest::default()),
-    }
+    Ok(last.map(|entry| read_manifest_entry(reader.get_mut(), &entry)))
 }
 
 fn read_manifest_entry<R: Read + Seek>(reader: &mut R, entry: &EntryInfo) -> Manifest {
@@ -287,21 +290,6 @@ fn read_manifest_entry<R: Read + Seek>(reader: &mut R, entry: &EntryInfo) -> Man
         }
         Err(_) => Manifest::default(),
     }
-}
-
-fn read_header<R: Read + Seek>(
-    archive: &mut ZipArchive<R>,
-    i: usize,
-    buf: &mut Vec<u8>,
-) -> Result<ClassHeader, String> {
-    let mut entry = archive.by_index(i).map_err(|e| e.to_string())?;
-    buf.clear();
-    entry
-        .by_ref()
-        .take(HEADER_LEN)
-        .read_to_end(buf)
-        .map_err(|e| e.to_string())?;
-    parse_header(buf).map_err(|e| e.to_string())
 }
 
 #[cfg(test)]

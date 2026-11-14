@@ -134,16 +134,12 @@ fn duplicate_names_are_all_counted() {
     assert_eq!((r.entries, r.classes), (2, 2));
     assert_eq!(r.size, (first.len() + second.len()) as u64);
 
-    // `version` still reads through `zip`, which keeps the last record's data per name.
     let s = scan_jar(&jar).expect("scan");
-    assert!(s.duplicate_names);
-    assert_eq!(s.entries.len(), 1);
-    assert_eq!(s.base.get(&61), Some(&1));
-    assert_eq!(s.base.get(&52), None);
+    assert_eq!(s.base, [(52, 1), (61, 1)].into_iter().collect());
 }
 
 #[test]
-fn scan_jar_shares_the_index() {
+fn scan_jar_agrees_with_read_info() {
     let dir = TempDir::new().expect("tempdir");
     let jar = make_jar_with_manifest(
         dir.path(),
@@ -153,20 +149,23 @@ fn scan_jar_shares_the_index() {
             ("com/", vec![]),
             ("com/A.class", class_bytes(0, 52)),
             ("META-INF/versions/17/com/A.class", class_bytes(0, 61)),
+            ("module-info.class", class_bytes(0, 53)),
+            ("com/Bad.class", vec![0xDE, 0xAD, 0xBE, 0xEF, 0, 0, 0, 52]),
         ],
     );
     let i = info(&jar);
     let s = scan_jar(&jar).expect("scan");
-    let scanned: Vec<_> = s.entries.iter().map(|e| e.name.clone()).collect();
-    assert_eq!(names(&jar), scanned);
-    assert_eq!(i.entries, s.entries.len() as u64);
-    assert_eq!(i.size, s.entries.iter().map(|e| e.size).sum::<u64>());
-    assert_eq!(
-        i.compressed_size,
-        s.entries.iter().map(|e| e.compressed_size).sum::<u64>()
-    );
     assert_eq!(i.manifest, s.manifest);
     assert_eq!(i.multi_release, s.multi_release);
+    assert!(s.multi_release);
+    let base: usize = s.base.values().sum();
+    let versioned: usize = s.versioned.values().flat_map(|m| m.values()).sum();
+    let counted = base + versioned + s.ignored_versioned + s.module_info.len() + s.invalid.len();
+    assert_eq!(
+        (base, versioned, s.module_info.len(), s.invalid.len()),
+        (1, 1, 1, 1)
+    );
+    assert_eq!(counted as u64, i.classes);
     assert_eq!(s.required_major(), Some(52));
 }
 
@@ -199,6 +198,7 @@ fn central_directory_cut_in_the_middle_fails_the_jar() {
     );
     assert_eq!(info_err(&jar), want);
     assert_eq!(names_err(&jar), want);
+    assert_eq!(scan_err(&jar), want);
 }
 
 // Two Zip64 records with every size at `u64::MAX`; nothing past the central directory is read.
