@@ -35,6 +35,9 @@ const MAX_WINDOW: u64 = EOCD_LEN as u64 + u16::MAX as u64;
 // tiny sizes in every archive on every thread of a folder scan touch ~1 MiB of extra pages.
 pub(crate) const SCRATCH_CAPACITY: usize = 512;
 
+// 32 KiB read gradle-api in 15.8 ms vs 18.7 ms at 8 KiB and 27 ms at 2 KiB, for the same 1.7 MiB peak.
+pub const ENTRY_READER_CAPACITY: usize = 32 * 1024;
+
 const CORRUPT: &str = "truncated or corrupt central directory";
 const MULTI_DISK: &str = "multi-disk archives are not supported";
 

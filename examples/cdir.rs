@@ -4,7 +4,8 @@ use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use jarscope::cdir::{CentralDirectory, EntryInfo, read_entry};
+use jarscope::cdir::{CentralDirectory, ENTRY_READER_CAPACITY, EntryInfo, EntryReader, read_entry};
+use jarscope::classfile::{ClassHeader, HeaderError, parse_header};
 use jarscope::find::find_jars;
 use rayon::prelude::*;
 use zip::ZipArchive;
@@ -37,12 +38,16 @@ fn main() {
     match mode.as_str() {
         "compare" => compare(&jars),
         "walk" => walk(&jars, use_zip),
+        "headers" => headers(&jars, use_zip),
+        "compare-headers" => compare_headers(&jars),
         _ => usage(),
     }
 }
 
 fn usage() -> ! {
-    eprintln!("usage: cdir compare <dir>... | cdir walk <dir|jar>... [--zip]");
+    eprintln!(
+        "usage: cdir compare <dir>... | cdir walk <dir|jar>... [--zip] | cdir headers <dir|jar>... [--zip] | cdir compare-headers <dir>..."
+    );
     std::process::exit(2);
 }
 
@@ -216,5 +221,153 @@ fn compare(jars: &[PathBuf]) {
     );
     println!(
         "manifests {mf_n} equal {mf_ok} over-cap-prefix-equal {mf_capped} different-or-error {mf_bad}"
+    );
+}
+
+type Header = Result<ClassHeader, HeaderError>;
+
+fn is_class(name: &str) -> bool {
+    name.ends_with(".class") && !name.ends_with('/')
+}
+
+fn cdir_headers(p: &Path, mut f: impl FnMut(Header)) -> anyhow::Result<()> {
+    let mut cd = CentralDirectory::new(BufReader::new(File::open(p)?))?;
+    let mut reader = EntryReader::new(BufReader::with_capacity(
+        ENTRY_READER_CAPACITY,
+        File::open(p)?,
+    ));
+    let mut buf = [0u8; 8];
+    while let Some(e) = cd.next_entry()? {
+        if !is_class(e.name) {
+            continue;
+        }
+        let n = reader.read_prefix(&e, &mut buf)?;
+        f(parse_header(&buf[..n]));
+    }
+    Ok(())
+}
+
+fn zip_headers(p: &Path, mut f: impl FnMut(Header)) -> anyhow::Result<()> {
+    let mut z = ZipArchive::new(BufReader::new(File::open(p)?))?;
+    let mut buf = Vec::with_capacity(8);
+    for i in 0..z.len() {
+        let mut d = z.by_index(i)?;
+        if !is_class(&d.name()?) {
+            continue;
+        }
+        buf.clear();
+        (&mut d).take(8).read_to_end(&mut buf)?;
+        f(parse_header(&buf));
+    }
+    Ok(())
+}
+
+fn headers(jars: &[PathBuf], use_zip: bool) {
+    let (mut classes, mut bad, mut errors, mut sum) = (0u64, 0u64, 0u64, 0u64);
+    for p in jars {
+        let mut count = |h: Header| match h {
+            Ok(h) => {
+                classes += 1;
+                sum = sum.wrapping_add(u64::from(h.major) * 65_536 + u64::from(h.minor));
+            }
+            Err(_) => bad += 1,
+        };
+        let r = if use_zip {
+            zip_headers(p, &mut count)
+        } else {
+            cdir_headers(p, &mut count)
+        };
+        if r.is_err() {
+            errors += 1;
+        }
+    }
+    println!(
+        "jars {} classes {classes} invalid {bad} errors {errors} checksum {sum}",
+        jars.len()
+    );
+}
+
+fn compare_headers(jars: &[PathBuf]) {
+    let classes = AtomicU64::new(0);
+    let lines: Vec<(u8, String)> = jars
+        .par_iter()
+        .filter_map(|p| {
+            let (mut a, mut b) = (Vec::new(), Vec::new());
+            let ra = cdir_headers(p, |h| a.push(h));
+            let rb = zip_headers(p, |h| b.push(h));
+            match (ra, rb) {
+                (Ok(()), Ok(())) => {}
+                (Err(x), Err(y)) => {
+                    return Some((
+                        2,
+                        format!("both error {}: cdir: {x:#} | zip: {y:#}", p.display()),
+                    ));
+                }
+                (x, y) => {
+                    return Some((
+                        2,
+                        format!(
+                            "ERROR {}: cdir {:?} | zip {:?}",
+                            p.display(),
+                            x.err().map(|e| format!("{e:#}")),
+                            y.err().map(|e| format!("{e:#}"))
+                        ),
+                    ));
+                }
+            }
+            if a.len() != b.len() {
+                let mut names = HashSet::new();
+                let dup = CentralDirectory::new(BufReader::new(File::open(p).ok()?))
+                    .ok()
+                    .is_some_and(|mut cd| {
+                        while let Ok(Some(e)) = cd.next_entry() {
+                            if !names.insert(e.name.to_string()) {
+                                return true;
+                            }
+                        }
+                        false
+                    });
+                let kind = if dup { 1 } else { 0 };
+                let label = if dup {
+                    "duplicate names"
+                } else {
+                    "MISMATCH count"
+                };
+                return Some((
+                    kind,
+                    format!(
+                        "{label} {}: cdir {} vs zip {}",
+                        p.display(),
+                        a.len(),
+                        b.len()
+                    ),
+                ));
+            }
+            classes.fetch_add(a.len() as u64, Ordering::Relaxed);
+            let i = a.iter().zip(&b).position(|(x, y)| x != y);
+            i.map(|i| {
+                (
+                    0,
+                    format!(
+                        "MISMATCH {} at class #{i}: {:?} vs {:?}",
+                        p.display(),
+                        a[i],
+                        b[i]
+                    ),
+                )
+            })
+        })
+        .collect();
+    let count = |k: u8| lines.iter().filter(|l| l.0 == k).count();
+    for (_, l) in &lines {
+        println!("{l}");
+    }
+    println!(
+        "jars {} classes compared {} mismatches {} duplicate-name {} errors {}",
+        jars.len(),
+        classes.load(Ordering::Relaxed),
+        count(0),
+        count(1),
+        count(2)
     );
 }
