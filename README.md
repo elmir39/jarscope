@@ -170,9 +170,9 @@ $ jarscope find --nested com.llamalad7.mixinextras.MixinExtrasBootstrap ~/Librar
 | 1 | No match |
 | 2 | Error: empty query, path missing or unreadable, or a single file that isn't a JAR |
 
-Warnings (for example, `version` finding duplicate entry names) go to stderr. `list` and
-`info` show every entry, duplicates included, like `unzip`. In a folder scan, a
-bad JAR is warned about and skipped, and the scan continues.
+Warnings go to stderr. `version`, `list` and `info` count every entry, duplicates
+included, like `unzip`. In a folder scan, a bad JAR is warned about and skipped, and the
+scan continues.
 
 ## Performance
 
@@ -181,7 +181,7 @@ Guava 33.5.0 (1,961 classes):
 
 | Command | Time | Peak memory |
 |---|---|---|
-| `jarscope version guava.jar` (all classes) | 9.4 ms | 2.3 MiB |
+| `jarscope version guava.jar` (all classes) | 6.6 ms | 2.0 MiB |
 | `jarscope list guava.jar` | 1.5 ms | 2.0 MiB |
 | `jarscope info guava.jar` | 1.4 ms | 2.1 MiB |
 | `jarscope find <exact name> guava.jar` | 1.7 ms | 3.2 MiB |
@@ -195,14 +195,15 @@ On a huge JAR (`gradle-api-9.6.0.jar`, 50,776 entries):
 
 | Command | Time | Peak memory |
 |---|---|---|
+| `jarscope version` | 15.6 ms | 2.0 MiB |
 | `jarscope info` | 3.5 ms | 1.8 MiB |
 | `jarscope list` | 23.9 ms | 7.2 MiB |
 | `jarscope find <missing name>` | 4.5 ms | 2.5 MiB |
 | `unzip -Z1` (list) | 53.8 ms | 2.3 MiB |
 | `unzip -v` (info) | 98.3 ms | 2.3 MiB |
 
-`info` and `find` read the central directory one record at a time, so their memory does not
-grow with the JAR. `list` keeps the names it has to sort.
+`version`, `info` and `find` read the central directory one record at a time, so their
+memory does not grow with the JAR. `list` keeps the names it has to sort.
 
 Finding `org.slf4j.Logger` in the 800 JARs of `~/.m2` (7 hits):
 
@@ -217,10 +218,10 @@ On `~/.gradle` (1,626 JARs among 57k files) `find` takes about 0.24 s and 5 MiB;
 
 jarscope is faster than `unzip` and uses about the same memory on normal JARs. On huge JARs `info` uses less than `unzip` and `find` about the same; `list` uses more (7.2 vs 2.3 MiB for 50k entries) because it sorts the names.
 
-Checking 800 JARs, one process per JAR: `jarscope version` takes 1.7 s; `jar tf` (which
+Checking 800 JARs, one process per JAR: `jarscope version` takes 1.6 s; `jar tf` (which
 only lists entries) takes 30 s.
 
-The release binary is about 1.0 MiB (1,065,600 bytes).
+The release binary is about 0.9 MiB (949,712 bytes).
 
 ## Roadmap
 

@@ -9,7 +9,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - Never panic on bad JARs; in folder scans, warn and skip the bad JAR.
 - Check output against `javap -v`, `jar tf` and `unzip -v`.
 - Comments only for very important, non-obvious *why* (JVM quirks, safety limits); no doc comments that restate the code.
-- `find`/`list`/`info` read via `cdir`, which yields every record like `jar tf`/`unzip`. Only `version` uses `zip`, which collapses duplicate names (`has_duplicate_names`) and warns.
+- Every command reads via `cdir` (every record, like `jar tf`/`unzip`). `zip` is a dev-dependency only, used to cross-check in tests and `examples/cdir.rs`.
+- A second reader on the same JAR needs a second `File::open`, never `try_clone` (the cloned descriptor shares the file offset).
 - `find` never reads the manifest: `META-INF/versions/N/` classes match regardless of `Multi-Release`.
 - `PathBuf` ordering is component-wise; sort paths bytewise with `as_encoded_bytes()` to match `LC_ALL=C sort`.
 - macOS malloc serves blocks of ≤ 256 bytes per thread and size class; in folder scans avoid new small per-JAR allocations (see `cdir::SCRATCH_CAPACITY`).
